@@ -1,6 +1,6 @@
-"""
-目标跟随（丢失后颜色比例特征重捕获 + 点击选物）video_proc40
-阶段 4/4（源自 attempt12，当前性能最好）：ORB 200/旋转降频 + 画面无文字(CSV) + 定时器修复(21->27.5fps) + 软死区
+# -*- coding: utf-8 -*-
+"""目标跟随（出生锚身份核验 + 空间特征观测）video_proc40
+阶段 4/4（源自 attempt14）：出生灰度锚 s_t + 出生颜色配方 s_r + 空间观测 _sp_feats + 黑边补漏
 """
 
 import argparse
@@ -12,6 +12,9 @@ from collections import deque
 
 import cv2
 import numpy as np
+
+# 公共基础设施（原 follow_core.py 内联，本文件自包含）：几何工具 / 视频输入 / 跟随控制器 /
+# 相机抽象 / 串口舵机 / 角度存储 / 叠加绘制 / 合成测试场。刻意不含 TargetTracker（各版本差异最大处）。
 
 FPS_CAP = 60.0
 ELEM = cv2.getStructuringElement
@@ -30,9 +33,7 @@ def box_iou(a, b):
 # 一、视频输入
 
 class FrameSource:
-    """
-    单一视频输入：打开 / 读帧(按上限丢帧) / 回到开头 / 释放。
-    """
+    """单一视频输入：打开 / 读帧(按上限丢帧) / 回到开头 / 释放。"""
 
     def __init__(self, source, is_camera=False, width=640, height=480, fps_cap=FPS_CAP):
         self.source = source
@@ -94,10 +95,83 @@ class FrameSource:
             self.cap.release()
             self.cap = None
 
+def _rle_cc(mask):
+    """返回与 CCA 同构的 `(n, stats, cents, lab_at)`：。"""
+    m = mask > 0
+    if not m.any():
+        return (1, np.zeros((1, 5), np.int32), np.zeros((1, 2), np.float64),
+                (lambda y, x: 0))
+    d = np.diff(m.astype(np.int8), axis=1, prepend=0, append=0)
+    ys, xs = np.nonzero(d == 1)              # 游程起点（行, 列）
+    _, xe = np.nonzero(d == -1)              # 游程终点（同一行内与起点一一对应）
+    n_run = len(ys)
+    parent = np.arange(n_run)
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return int(a)
+
+    rows, r0 = np.unique(ys, return_index=True)      # ys 已按行升序
+    r1 = np.append(r0[1:], n_run)
+    runs_of_row = {}
+    for ri in range(len(rows)):
+        y = int(rows[ri])
+        runs_of_row[y] = [(int(xs[k]), int(xe[k]), int(k)) for k in range(r0[ri], r1[ri])]
+    for ri in range(1, len(rows)):                   # 行间合并
+        y_pre, y_cur = int(rows[ri - 1]), int(rows[ri])
+        if y_cur != y_pre + 1:
+            continue
+        a = runs_of_row[y_pre]
+        j = 0
+        for x0c, x1c, kc in runs_of_row[y_cur]:
+            while j < len(a) and a[j][1] < x0c:      # 8 连通：区间距离 ≤1 也算相连
+                j += 1
+            jj = j
+            while jj < len(a) and a[jj][0] <= x1c:
+                ra, rb = find(a[jj][2]), find(kc)
+                if ra != rb:
+                    parent[max(ra, rb)] = min(ra, rb)
+                jj += 1
+    acc = {}
+    for y, rr in runs_of_row.items():                # 聚合外接框/面积/质心
+        for x0, x1, k in rr:
+            c = find(k)
+            ln = x1 - x0
+            sx = (x0 + x1 - 1) * 0.5 * ln
+            a = acc.get(c)
+            if a is None:
+                acc[c] = [x0, x1, y, y + 1, ln, sx, y * ln]
+            else:
+                a[0] = min(a[0], x0)
+                a[1] = max(a[1], x1)
+                a[2] = min(a[2], y)
+                a[3] = max(a[3], y + 1)
+                a[4] += ln
+                a[5] += sx
+                a[6] += y * ln
+    # 返回结构与 CCA **逐位同构**（numpy 数组、0 号背景占位），调用点才能只换一行
+    order = sorted(acc)
+    stats = np.zeros((len(order) + 1, 5), np.int32)
+    cents = np.zeros((len(order) + 1, 2), np.float64)
+    remap = {}
+    for idx, c in enumerate(order, start=1):
+        x0, x1, y0, y1, area, sx, sy = acc[c]
+        remap[c] = idx
+        stats[idx] = (x0, y0, x1 - x0, y1 - y0, area)
+        cents[idx] = (sx / area, sy / area)
+
+    def lab_at(y, x):
+        for x0, x1, k in runs_of_row.get(int(y), ()):
+            if x0 <= x < x1:
+                return remap[find(k)]
+        return 0
+
+    return len(order) + 1, stats, cents, lab_at
+
 def _dead_taper(a, lo):
-    """
-    软死区权重：|a| ≤ lo 时 0（完全不动），lo~2lo 线性 0→1，≥2lo 时 1（全力）。
-    """
+    """硬死区（|e|<lo 直接切零）会自激**粘滑极限环**：误差在死区内积累→出界→突发修正。"""
     if a <= lo:
         return 0.0
     hi = lo * 2.0
@@ -106,9 +180,7 @@ def _dead_taper(a, lo):
     return (a - lo) / (hi - lo)
 
 class FollowController:
-    """
-    速度式控制 + 速度前馈。角速度按 lp_tau 低通、限幅、限加速度，再积分成角度。
-    """
+    """速度式控制 + 速度前馈。角速度按 lp_tau 低通、限幅、限加速度，再积分成角度。"""
 
     def __init__(self, hfov=60.0, vfov=36.0, kp=2.5, kd=0.15, kff=1.0,
                  deadband_deg=0.5, ki=0.0, max_rate=60.0, max_acc=400.0, lp_tau=0.12,
@@ -135,6 +207,7 @@ class FollowController:
     def update(self, e, e_vel, dt, hold=False, cam_rate=None):
         ex, ey = float(e[0]), float(e[1])
         vx, vy = float(e_vel[0]), float(e_vel[1])
+        # 死区（度）→ 软权重：只压反馈项，不压前馈
         sx = _dead_taper(abs(ex * self.hfov), self.deadband_deg)
         sy = _dead_taper(abs(ey * self.vfov), self.deadband_deg)
         ex_l = (ex + vx * self.lead) * sx
@@ -154,6 +227,7 @@ class FollowController:
             ox = self.cam_rate[0] + vx * self.hfov
             oy = self.cam_rate[1] - vy * self.vfov
             # **可信度闸门**：估计值超出"我们可能跟上"的范围时，说明它不是目标的真实运动 （多半是我们测不到的相机/平台运动，或坏的速度估计）。此时前馈会把云台 一路推到底 —— 实测视频在环里出现过
+            # −45°/s 的单向满速指令。 遇到不可信就放弃这一帧的前馈，交给 P+D 反馈去纠（会慢一点，但不会失控）。
             lim = self.ff_limit * self.max_rate
             if abs(ox) > lim or abs(oy) > lim:
                 ox = oy = 0.0
@@ -179,14 +253,12 @@ class FollowController:
         return self.pan, self.tilt, self.info
 
     def bearing_of(self, e):
-        """
-        由"当前角度 + 目标在画面里的偏移"算出目标的世界方位 (pan, tilt)。
-        """
+        """由"当前角度 + 目标在画面里的偏移"算出目标的世界方位 (pan, tilt)。"""
         return (self.pan + float(e[0]) * self.hfov,
                 self.tilt - float(e[1]) * self.vfov)
 
     def slew_to(self, pan_t, tilt_t, dt, rate=40.0, tol=0.5):
-        """限速平滑转到目标角度（回正用；不是瞬间跳变，避免舵机猛甩）"""
+        """限速平滑转到目标角度（回正用；不是瞬间跳变，避免舵机猛甩）。"""
         for i, (cur, tgt) in enumerate(((self.pan, pan_t), (self.tilt, tilt_t))):
             d = tgt - cur
             if abs(d) < tol:
@@ -202,7 +274,7 @@ class FollowController:
                      "pan": self.pan, "tilt": self.tilt, "dead": False, "hold": False}
         return self.pan, self.tilt, self.info
 
-# 四、云台接口：虚拟（仿真）/ 串口
+# 二、云台接口：虚拟（仿真）/ 串口
 
 class CameraLink:
     def command(self, pan_deg, tilt_deg, dt):
@@ -215,10 +287,7 @@ class CameraLink:
         pass
 
 class SimCamera(CameraLink):
-    """虚拟云台：模拟真实执行器的四件事 —— 延迟 / 速率限幅 / 齿轮回差 / 死区-量化-抖动。
-
-    不建这些，仿真里调出来的增益一上真机就振荡。默认参数取 MG90S 量级。
-    """
+    """虚拟云台：模拟真实执行器的四件事 —— 延迟 / 速率限幅 / 齿轮回差 / 死区-量化-抖动。"""
 
     def __init__(self, hfov=60.0, vfov=36.0, frame_w=640, frame_h=480, latency=0.10,
                  max_rate=120.0, max_acc=600.0, deadband_deg=0.5, backlash_deg=1.0,
@@ -271,29 +340,24 @@ class SimCamera(CameraLink):
         return {"pan": float(self.ang[0]), "tilt": float(self.ang[1]), "ok": True}
 
     def offset_px(self):
-        """视窗偏移（世界坐标像素）：pan 正=向右转 -> 视窗右移；tilt 正=向上看 -> 视窗上移"""
+        """视窗偏移（世界坐标像素）：pan 正=向右转 -> 视窗右移；tilt 正=向上看 -> 视窗上移。"""
         return (self.ang[0] * self.ppd_x, -self.ang[1] * self.ppd_y)
 
     def valid_rect(self):
-        """**真实像素**的矩形 (x0, y0, x1, y1)；矩形外是因为云台平移露出来的黑边。
-            render() 里 dst(x,y) = src(x-ox, y-oy)，所以输出有效的条件是
-            0 <= x-ox < W 且 0 <= y-oy < H。黑边必须从检测里排除：黑区没有内容，但它的
-        """
+        """**真实像素**的矩形 (x0, y0, x1, y1)；矩形外是因为云台平移露出来的黑边。"""
         ox, oy = self.offset_px()
         dx, dy = int(round(ox)), int(round(oy))
         return (max(0, dx), max(0, dy), min(self.W, self.W + dx), min(self.H, self.H + dy))
 
     def render(self, frame):
-        """
-        非拼接图模式：直接按当前角度平移画面，露出来的地方填黑。
-        """
+        """非拼接图模式：直接按当前角度平移画面，露出来的地方填黑。"""
         ox, oy = self.offset_px()
         M = np.float32([[1, 0, -ox], [0, 1, -oy]])
         return cv2.warpAffine(frame, M, (self.W, self.H), flags=cv2.INTER_LINEAR,
                               borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
 
 class ServoSerial(CameraLink):
-    """真实云台（串口驱动板）：发绝对角度，脉宽换算放在单片机上（换舵机只改单片机）"""
+    """真实云台（串口驱动板）：发绝对角度，脉宽换算放在单片机上（换舵机只改单片机）。"""
 
     def __init__(self, port, baud=115200, timeout=0.02):
         import serial                        # pyserial 只在真硬件模式下需要
@@ -325,11 +389,10 @@ def make_camera(args, W, H):
     return SimCamera(hfov=args.hfov, vfov=args.vfov, frame_w=W, frame_h=H,
                      latency=args.latency, max_rate=args.sim_rate)
 
-# 六、云台角度存储（JSON）
+# 三、云台角度存储（JSON）
 
 class GimbalState:
-    """云台角度/标定/行程的持久化。没有位置回读的舵机上电时不知道自己指在哪，
-    这个文件是软件侧唯一的记忆；**它不能替代编码器**（碰撞/丢步的绝对漂移发现不了）。"""
+    """云台角度/标定/行程的持久化。没有位置回读的舵机上电时不知道自己指在哪，。"""
 
     def __init__(self, path=None, ang_limit=120.0, px_per_deg=12.0):
         self.path = path
@@ -396,21 +459,28 @@ def draw_overlay(img, box, state, search_rect=None, src="ncc"):
     cv2.rectangle(img, (cx - db, cy - db), (cx + db, cy + db), (0, 200, 0), 1)
     if box is not None:
         x, y, w, h = [int(round(v)) for v in box]
-        color = (0, 0, 255) if src == "recipe" else (0, 200, 0)
+        # 框色标出**本帧用的定位机制 / 状态**：蓝=帧间 NCC，红=颜色构成配方（丢失重捕获），
+        # 黄=身份核验不过（双锚分数掉下去了，本帧冻结学习）
+        if src == "recipe":
+            color = (0, 0, 255)
+        elif src == "unanchor":
+            color = (0, 255, 255)
+        else:
+            color = (255, 0, 0)
         cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
         bx, by = int(x + w / 2), int(y + h / 2)
         cv2.circle(img, (bx, by), 3, color, -1)
         cv2.arrowedLine(img, (bx, by), (cx, cy), (0, 200, 0), 1, tipLength=0.12)
+    # 丢失后的扩大搜索框：绿色标出
     if search_rect is not None:
         sx, sy, sw, sh = [int(round(v)) for v in search_rect]
         cv2.rectangle(img, (sx, sy), (sx + sw, sy + sh), (0, 255, 0), 2)
+    # 画面上**不画任何文字**：原来底部那行 state/score/err/DEAD/PAUSED 在 1.8MP 画布上 是实打实的开销，文字信息一律改走 CSV（见 run() 里的 csv_fh）。
 
-# 八、合成测试场（自检 / 场景矩阵用，完全确定性）
+# 四、合成测试场（自检 / 场景矩阵用，完全确定性）
 
 class SynthStage:
-    """
-    大画布 + 随机纹理背景 + 一个高纹理目标，可按视窗取景。
-    """
+    """大画布 + 随机纹理背景 + 一个高纹理目标，可按视窗取景。"""
 
     def __init__(self, W=640, H=480, scale=3, seed=0, tw=80, th=120):
         rng = np.random.default_rng(seed)
@@ -443,7 +513,7 @@ class SynthStage:
                          self.H / 2.0 + r[1] - self.th / 2.0, self.tw, self.th], np.float32)
 
     def render(self, off_px, tint=None):
-        """render：off_px 为视窗偏移；tint 可给目标上色（颜色干扰物测试用）"""
+        """render：off_px 为视窗偏移；tint 可给目标上色（颜色干扰物测试用）。"""
         x0 = int(clamp(int(round(self.cx + off_px[0] - self.W / 2.0)), 0, self.sw - self.W))
         y0 = int(clamp(int(round(self.cy + off_px[1] - self.H / 2.0)), 0, self.sh - self.H))
         frame = self.scene[y0:y0 + self.H, x0:x0 + self.W].copy()
@@ -476,16 +546,14 @@ class SynthStage:
     def truth(self):
         return self.truth_box
 
-# 九、主循环（GUI）：静态等待模式
+# 五、主循环（GUI）：静态等待模式
 
 FPS_CAP = 30.0
 GAP = 4
 MAIN_WIN = "Follow static-wait (attempt9)"
 
 class TargetTracker:
-    """
-    局部跟踪（NCC+PSR） + HSV(HS) 前景/背景模型 + 分层区域重检测。
-    """
+    """几条用血换来的规矩（都是实测踩坑后定下的，别改）：。"""
 
     STATE_TRACK = "track"
     STATE_LOST = "lost"
@@ -507,7 +575,8 @@ class TargetTracker:
                  search_margin=1.0, ncc_ds=0.5,
                  size_every=2, bwd_every=3, refine_every=2, model_every=2,
                  score_psr_free=0.85, score_soft=0.68, soft_pull=0.35, soft_jump=0.9,
-                 jump_cap=0.18, jump_penalty=0.8, slow_gain=0.55, search_grow=0.9):
+                 jump_cap=0.18, jump_penalty=0.8, slow_gain=0.55, search_grow=0.9,
+                 anchor_t_min=0.15, anchor_r_min=0.55):
         self.search_ratio = float(search_ratio)
         self.score_keep, self.psr_keep = float(score_keep), float(psr_keep)
         self.score_hi, self.psr_hi = float(score_hi), float(psr_hi)
@@ -527,14 +596,20 @@ class TargetTracker:
         self.ref_q = float(ref_q)            # 掩膜阈值锚：框内 LLR 的这个分位
         self._grow_ok = False                # 置信帧才允许突破绝对放大上限
         self.ref_lr = float(ref_lr)          # 基准的自更新速率（只在置信帧）
+        # **搜索半径绝对下限**：见 _match 注释。解决"画面转动/目标大表观位移时框不动"。
         self.search_pad_min = max(8, int(search_pad_min))
+        # **框内 LLR 的绝对下限（相对初始框）**：低于 llr_init 的这个倍数就认为框已离开 目标。见 update() 里"颜色分布特征比对"那段注释。0.35 是很宽松的：只挡
+        # "框已经明显不在目标上"（d.mp4 坏帧掉到负值），正常光照/遮挡波动不会触发。
         self.llr_floor_frac = float(llr_floor_frac)
+        # **累计尺寸偏离上限**（相对初始框面积）：非真增长时不许超 size_dev_cap。 专治"每帧 1px、十几帧慢爬"的漂移——单帧闸门看不见它，累计闸门看得见。
         self.size_dev_cap = float(size_dev_cap)
         # **基准"跟涨"速率**（关键修复，见 _fit_size）：ref_lr=0.02 是"防棘轮"的慢刹车， 目标真走近（面积每帧 +6%）时 ref_area 永远追不上 ->
+        # 面积闸门把合法增长也判死。 另给一条"证据充分时快速跟涨"的通道：当掩膜面积连续多帧明显大于基准、且边框 贴合判据通过（说明不是吃背景），就用 ref_grow_lr 快速抬高 ref_area。
         self.ref_grow_lr = float(ref_grow_lr)
         self.ref_grow_ok = float(ref_grow_ok)   # 触发快速跟涨的"掩膜/基准面积比"阈值
         self.step_grow = float(step_grow)       # 确认真增长时的单帧尺寸步长上限
         self.ema_grow = float(ema_grow)         # 确认真增长时的尺寸 EMA（更快跟涨）
+        # 全局运动补偿（搜索中心预测项）：见 _global_shift
         self.gm_comp = bool(gm_comp)
         self.gm_scale = float(gm_scale)         # 相位相关降采样倍率（0.25 = 4x 提速）
         self.ncc_ds = float(ncc_ds)             # attempt10：NCC 搜索窗降采样倍率（0.5 = 4x 提速）
@@ -544,24 +619,30 @@ class TargetTracker:
         self.gm_rot_max = float(gm_rot_max)     # 单帧旋转限幅
         self.gm_orb_n = int(gm_orb_n)           # ORB 特征数
         self.gm_orb_min = int(gm_orb_min)       # 用于估计的最小内点数
-        self.gm_rot_every = max(1, int(gm_rot_every))  # video_proc40：ORB 旋转估计降频
+        self.gm_rot_every = max(1, int(gm_rot_every))  # attempt12：ORB 旋转估计降频
         self._gm_rot_tick = 0                   # 旋转估计计数器
         self._gm_prev, self._gm_win = None, None
         self._gm_kp = (None, None)
         self._orb = self._bf = None
         self._rot_ctx = None
+        # 丢失后搜索域：固定外扩倍数（1.0 = 长宽各扩 2 倍，面积 4 倍）
         self.search_margin = float(search_margin)
+        # 降频门（帧）：尺寸量测 / 互一致性校验 / 大窗精定位。1 = 每帧都做。
         self.size_every = max(1, int(size_every))
         self.bwd_every = max(1, int(bwd_every))
         self.refine_every = max(1, int(refine_every))
         self.model_every = max(1, int(model_every))
+        # 高分豁免阈值：NCC 分数 >= 它就免检 PSR（小窗/小目标上 PSR 不可靠，见 update 注释）
         self.score_psr_free = float(score_psr_free)
         self.score_soft = float(score_soft)   # 次级豁免的最低分（配 d_peak 判据）
         self.soft_pull = float(soft_pull)     # 峰值允许偏离预测中心的比例
         self.soft_jump = float(soft_jump)     # 峰值帧间允许跳动的比例（稳定性判据）
+        # **单帧最大跳变**：NCC 峰相对预测中心的位移上限（×框尺寸）。超过就认为咬错了， 把峰值拽到"朝该方向、不超过此上限"处并打折分数 —— 见 update() 的跳变闸门。
         self.jump_cap = float(jump_cap)
         self.jump_penalty = float(jump_penalty)
+        # **慢跟随比例**：仅当走"第三条通道(slow)"时，位置每帧只移动这段比例。
         self.slow_gain = float(slow_gain)
+        # **渐进扩窗速率**：每 missing 一帧，搜索半径放大 search_grow 倍（见 update）。
         self.search_grow = float(search_grow)
         self._last_peak = None
 
@@ -581,38 +662,55 @@ class TargetTracker:
         self.valid = None                   # 真实像素矩形 (x0,y0,x1,y1)；外圈是黑边，不算
         self.invalid_llr = -20.0             # 黑边处强制的 LLR（"绝对不是目标"）
         # ---- 颜色比例特征存储（目标自身统计量基准）---- 存的是目标的**绝对**基准：面积、长宽比、掩膜填充率、边缘密度。 为什么必须存绝对基准：闸门若只跟**当前框**比（面积比 0.3~2.2
+        # 之类），框和掩膜会
         self.ref_area = None
         self.ref_aspect = None
         self.ref_fill = None
         self.ref_edge = None
         self.ref_llr_q = None                # 基准框内 LLR 的低分位 -> 掩膜阈值锚
+        # ---- 颜色构成特征（"颜色配方"）---- 目标框内占比最大的前 K 个颜色及其**相对占比**（如紫 0.7 / 黄 0.3）。
+        # 这是颜色之间的配比，**与框大小无关**：换个尺寸的框，只要还是"紫多黄少"， 配方就一样。重捕获时在搜索框内滑窗，找颜色构成最像这个配方的物体。
         self.color_recipe = None             # [(hs_bin, weight), ...] 按权重降序
         self.recipe_k = 3                    # 只存占比最大的 3 种颜色
         self.recipe_min_sim = 0.55           # 配方相似度门槛（直方图交集，0~1）
         self.recipe_confirm_hi = 0.8         # 相似度≥此值只需 1 帧确认，否则 2 帧
         self.recipe_leak_max = 0.25          # 框外环带彩色占比上限（挡"从大物体切子窗"）
-        self.recipe_ratio_tol = 0.45         # 配方**占比**允许的相对偏差（主色/配比顺序）
         self.init_area = None                # 用户选定框的面积（绝对放大上限的锚）
         self.grow_hi = 3.0                   # 不置信时最多放大到初始面积的几倍
         self.anchor_box = None               # 最后一次**置信**框 = 丢失点附近搜索的锚点
-        self.src = "ncc"                     # 本帧定位来源："ncc"=帧间NCC(绿框) / "recipe"=颜色构成配方(红框)
+        self.src = "ncc"                     # 定位来源：ncc=帧间NCC(蓝) / recipe=配方重捕(红) / unanchor=身份不过(黄)
+        # ---- attempt14：出生锚身份核验（决定"信不信、学不学"）----
+        self.anchor_t_min = float(anchor_t_min)   # s_t 下限（0=关闭该锚）
+        self.anchor_r_min = float(anchor_r_min)   # s_r 下限（0=关闭该锚）
+        self.template0 = None               # 冻结的出生灰度模板（永不更新）
+        self.anchor_area = None             # 冻结锚时的框面积（判"尺度是否基本没变"）
+        self.s_t = self.s_r = None          # 本帧"当前框 vs 出生锚"的两个相似度
+        self.anchored = True                # 双锚都认账? 否 -> 冻结学习
+        self.id_ok = True                   # 颜色身份认账? 否 -> **不采纳位置**（走向判丢）
+        self.n_unanchor = 0                 # 身份不过的累计帧数
+        self._unanchor_run = 0              # 身份不过的**连续**帧数（≥2 才真的拒绝位置）
+        # ---- attempt14 观测：空间特征（δ / Δ_inv / Δ_dir / clip），只写 CSV，不参与判决 ----
+        self.sp_desc0 = None                # 出生锚的空间描述子（init 冻结一次）
+        self.sp_dlt = self.sp_dinv = self.sp_ddir = None
+        self.sp_clip = None
         self._cand_hits = 0
         self._cand_box = None
         self.n_recover = 0
+        # ---- 提速：缓存与降频（每帧最贵的是 HSV 转换 + LLR 图 + 匹配）----
         self._lut = None                     # LLR 查找表缓存（只有模型更新后才失效）
         self._lut_dirty = True
         self._bwd_tick = 0
         self._tick = 0
         self._ext_cache = None
+        # 云台视角坐标系补偿（见 _warp_compensate）；主循环每帧经 set_view_angles 更新。
         self._view_ang = None       # 本帧 view 对应的云台角 (pan,tilt,deg)
         self._wt_prev = None        # 上一帧 view 的云台角（补偿基准）
         self._view_wh = None        # 本帧 view 的 (W,H)
         self._ppd = None            # (px/deg_x, px/deg_y)，由 set_view_angles 传入
         self._last_dt = 1 / 30.0
-        self._warp_dxy = (0.0, 0.0)  # 本帧 warp 造成的假位移（速度估计要扣掉）
-        self._warp_dpan = 0.0
         self._gpan_px = (0.0, 0.0)   # 本帧云台自身运动造成的画面位移（进搜索半径）
 
+    # ---------------- 基础工具 ----------------
     @staticmethod
     def _prep(patch):
         p = patch.astype(np.float32)
@@ -620,9 +718,7 @@ class TargetTracker:
 
     @staticmethod
     def _grab(gray, box, pad=False):
-        """
-        按框取一块。pad=True 时框外**补黑**（不复制边缘；画面外本来就是"没有"）。
-        """
+        """按框取一块。pad=True 时框外**补黑**（不复制边缘；画面外本来就是"没有"）。"""
         x, y, w, h = [int(round(v)) for v in box]
         if w < 4 or h < 4:
             return None
@@ -640,7 +736,7 @@ class TargetTracker:
 
     @staticmethod
     def _subpixel(res, loc):
-        """抛物线拟合求亚像素峰（整数像素对"保持居中"不够）"""
+        """抛物线拟合求亚像素峰（整数像素对"保持居中"不够）。"""
         x, y = loc
         if x <= 0 or y <= 0 or x >= res.shape[1] - 1 or y >= res.shape[0] - 1:
             return float(x), float(y)
@@ -653,9 +749,7 @@ class TargetTracker:
 
     @staticmethod
     def _psr(res, loc, r=4, valid=None):
-        """
-        峰值旁瓣比：峰值比旁瓣高出几个标准差。valid 排除补边区（那些响应不是证据）
-        """
+        """峰值旁瓣比：峰值比旁瓣高出几个标准差。valid 排除补边区（那些响应不是证据）。"""
         h, w = res.shape
         x0, x1 = max(0, loc[0] - r), min(w, loc[0] + r + 1)
         y0, y1 = max(0, loc[1] - r), min(h, loc[1] + r + 1)
@@ -672,11 +766,10 @@ class TargetTracker:
         return float((res[loc[1], loc[0]] - float(s.mean())) / (sd + 1e-6))
 
     def _match(self, gray, tmpl, center, size, search_ratio, full=False, rot=0.0):
-        """
-        在 center 附近搜 tmpl，返回 ((x,y,w,h), 分数, PSR)。
-        """
+        """在 center 附近搜 tmpl，返回 ((x,y,w,h), 分数, PSR)。"""
         H, W = gray.shape[:2]
         tw, th = tmpl.shape[1], tmpl.shape[0]
+        # 降采样因子（1.0 = 关闭）。仅在非 full、无旋转时启用：旋转需在原分辨率做才不糊。
         ds = float(getattr(self, "ncc_ds", 1.0))
         if full or abs(rot) >= self.gm_rot_min or ds >= 0.999 or min(tw, th) < 8:
             ds = 1.0
@@ -705,6 +798,7 @@ class TargetTracker:
             win = cv2.copyMakeBorder(gray[cy0:cy1, cx0:cx1], cy0 - wy0,
                                      wy0 + wh - cy1, cx0 - wx0, wx0 + ww - cx1,
                                      cv2.BORDER_CONSTANT, value=0)
+            # **去旋转**：把搜索窗绕它的中心反向旋转 -rot，使窗口"转回来"与模板对齐。 旋转中心取窗口几何中心，旋转后 peak 坐标要再做 +rot 反变换（见下）。
             if abs(rot) >= self.gm_rot_min and win.size:
                 cwin = (win.shape[1] / 2.0, win.shape[0] / 2.0)
                 M = cv2.getRotationMatrix2D(cwin, rot, 1.0)
@@ -734,6 +828,7 @@ class TargetTracker:
         _, score, _, loc = cv2.minMaxLoc(res)
         px, py = self._subpixel(res, loc)
         ax, ay = x0 + px, y0 + py
+        # 若做过去旋转，把 peak 位置从"已去旋转的窗口坐标系"转回原图：窗口点 (ax-wx0, ay-wy0) 绕窗口中心做 +rot 反变换，再加回窗口原点。
         rc = getattr(self, "_rot_ctx", None)
         if rc is not None:
             rot_used, (ccx, ccy), wx0_, wy0_ = rc
@@ -746,10 +841,7 @@ class TargetTracker:
                 self._psr(res, loc, valid=valid))
 
     def _match_ds(self, gray, tmpl, center, size, search_ratio, ds):
-        """降采样版 _match（attempt10）。把搜索窗与模板各按 ds 缩放，在**小图**上做
-        TM_CCOEFF_NORMED，峰值/PSR/亚像素都在小图网格里算，最后把峰值坐标 /ds 映射回原图。
-        搜索窗、valid 掩膜、PSR 邻居半径都按小图尺度同步缩放，保证语义一致。
-        """
+        """降采样版 _match（attempt10）。把搜索窗与模板各按 ds 缩放，在**小图**上做。"""
         H, W = gray.shape[:2]
         tw, th = tmpl.shape[1], tmpl.shape[0]
         tws, ths = max(2, int(round(tw * ds))), max(2, int(round(th * ds)))
@@ -758,6 +850,7 @@ class TargetTracker:
         if self._gpan_px:
             mx = max(mx, int(round(abs(self._gpan_px[0]))) + 6)
             my = max(my, int(round(abs(self._gpan_px[1]))) + 6)
+        # 搜索半径按 ds 缩放（至少留 4px 余量给小图）
         mxs, mys = max(int(round(mx * ds)), 4), max(int(round(my * ds)), 4)
         wx0 = int(round(center[0] - tw / 2.0 - mx))
         wy0 = int(round(center[1] - th / 2.0 - my))
@@ -775,7 +868,8 @@ class TargetTracker:
         if gw.shape[0] < ths + 2 or gw.shape[1] < tws + 2:
             return None
         res = cv2.matchTemplate(gw, gt, cv2.TM_CCOEFF_NORMED)
-        # 小图 → 原图的列/行映射：小图第 k 列采样点在原图窗口的 x = (k+0.5)/ds - 0.5（像素中心约定）。
+        # 小图 → 原图的列/行映射：小图第 k 列采样点在原图窗口的 x = (k+0.5)/ds - 0.5（像素中心约定）。 这里把每个小图列对应的**原图候选框左上角 x** 记入 oxs，用于
+        # valid 边界/黑边判定。
         kx = (np.arange(res.shape[1]) + 0.5) / ds - 0.5 + wx0
         ky = (np.arange(res.shape[0]) + 0.5) / ds - 0.5 + wy0
         valid = (((kx >= 0) & (kx <= W - tw))[None, :]
@@ -786,30 +880,28 @@ class TargetTracker:
                       & ((ky >= vy0) & (ky + th <= vy1))[:, None])
         res = np.where(valid, res, -1.0).astype(np.float32)
         _, score, _, loc = cv2.minMaxLoc(res)
-        # 不能再用 loc + px（会重复计一次 loc —— 这正是之前偏了 (mx,my) 的原因）。
+        # _subpixel 返回的是**小图绝对坐标**（loc + 亚像素偏移），直接做尺度反变换即可， 不能再用 loc + px（会重复计一次 loc —— 这正是之前偏了 (mx,my) 的原因）。
         px, py = self._subpixel(res, loc)
         ax = (px + 0.5) / ds - 0.5 + wx0
         ay = (py + 0.5) / ds - 0.5 + wy0
         return ((ax, ay, tw, th), float(score),
                 self._psr(res, loc, r=max(1, int(round(4 * ds))), valid=valid))
 
+    # ---------------- HSV(HS) 前景/背景模型 ----------------
     def _hs_idx(self, hsv):
-        """把 HSV 降到 128 个 (H,S) 格子。**不用 V**：V 是亮度，光照一变就废。
-        """
+        """把 HSV 降到 128 个 (H,S) 格子。**不用 V**：V 是亮度，光照一变就废。"""
         return ((hsv[..., 0].astype(np.int32) >> 4) * self.HS_S
                 + (hsv[..., 1].astype(np.int32) >> 5))
 
     def _hs_hist(self, hsv):
-        """S 加权的 HS 直方图。
-        """
+        """S 加权的 HS 直方图。"""
         idx = self._hs_idx(hsv).ravel()
         w = (0.25 + 0.75 * (hsv[..., 1].astype(np.float64) / 255.0)).ravel()
         h = np.bincount(idx, weights=w, minlength=self.HS_H * self.HS_S)
         return h / (h.sum() + 1e-9)
 
     def _llr_lut(self):
-        """LLR 查找表（128 格）。缓存：只有前景/背景模型更新后才重算 ——
-        原来每调用一次就做一遍 log，而一帧里 llr_map 会被调用十几次。"""
+        """LLR 查找表（128 格）。缓存：只有前景/背景模型更新后才重算。"""
         if self._lut is None or self._lut_dirty:
             fg = np.maximum(self.fg, self.hist_floor)
             bg = np.maximum(self.bg, self.hist_floor)
@@ -818,9 +910,10 @@ class TargetTracker:
         return self._lut
 
     def llr_map(self, hsv):
-        """逐像素"更像目标还是更像背景"的对数似然比图"""
+        """逐像素"更像目标还是更像背景"的对数似然比图。"""
         m = self._llr_lut()[self._hs_idx(hsv)]
         if self.valid is not None:
+            # **黑边（云台平移露出来的部分）一律判成"绝对不是目标"**。 在这里堵一次，后面所有用到 LLR 的地方（掩膜、峰值、候选打分）自动都干净了。
             x0, y0, x1, y1 = self.valid
             m[:y0, :] = self.invalid_llr
             m[y1:, :] = self.invalid_llr
@@ -828,15 +921,27 @@ class TargetTracker:
             m[:, x1:] = self.invalid_llr
         return m
 
-    def set_valid_rect(self, rect):
-        """告诉跟踪器哪块是**真实像素**（云台平移露出的黑边不算检测范围）。
+    def _clamp_valid(self, box, Wf=None, Hf=None):
+        """把框夹回**真实像素**区（黑边没有内容，框进去就是假跟）。"""
+        b = np.array(box, np.float32)
+        if self.valid is not None:
+            vx0, vy0, vx1, vy1 = self.valid
+        else:
+            if Wf is None or Hf is None:
+                Wf, Hf = (self._view_wh if self._view_wh else (1e9, 1e9))
+            vx0, vy0, vx1, vy1 = 0.0, 0.0, float(Wf), float(Hf)
+        b[0] = float(clamp(b[0], vx0, max(vx0, vx1 - b[2])))
+        b[1] = float(clamp(b[1], vy0, max(vy0, vy1 - b[3])))
+        b[2] = float(min(b[2], max(1.0, vx1 - vx0)))
+        b[3] = float(min(b[3], max(1.0, vy1 - vy0)))
+        return b
 
-        视频在环时每帧调用；真机没有黑边，保持 None 即可。
-        """
+    def set_valid_rect(self, rect):
+        """告诉跟踪器哪块是**真实像素**（云台平移露出的黑边不算检测范围）。"""
         self.valid = None if rect is None else tuple(int(round(v)) for v in rect)
 
     def _valid_ok(self, rect):
-        """矩形是否在真实像素范围内（和有效区有交集才算）"""
+        """矩形是否在真实像素范围内（和有效区有交集才算）。"""
         if self.valid is None:
             return True
         x0, y0, x1, y1 = self.valid
@@ -844,7 +949,7 @@ class TargetTracker:
                     or rect[1] + rect[3] <= y0 or rect[1] >= y1)
 
     def _clip_roi(self, x0, y0, x1, y1):
-        """把 ROI 夹到真实像素范围内"""
+        """把 ROI 夹到真实像素范围内。"""
         if self.valid is None:
             return x0, y0, x1, y1
         vx0, vy0, vx1, vy1 = self.valid
@@ -855,9 +960,7 @@ class TargetTracker:
         return (x - w * grow, y - h * grow, w * (1 + 2 * grow), h * (1 + 2 * grow))
 
     def _update_model(self, bgr, box):
-        """
-        只在置信帧、框完整在**真实像素**内时更新模型。
-        """
+        """只在置信帧、框完整在**真实像素**内时更新模型。"""
         H, W = bgr.shape[:2]
         x, y, w, h = box
         if x < 2 or y < 2 or x + w > W - 2 or y + h > H - 2:
@@ -880,24 +983,23 @@ class TargetTracker:
             self.bg = (1 - lr) * self.bg + lr * hb
         self._lut_dirty = True               # 模型变了 -> 作废 LLR 缓存
         # 颜色模型的"信息量" = 前景/背景直方图的距离（0..1）。 纯灰或目标与周围同色的场景里两者几乎相同，这时**颜色判据必须自动失效**， 退回到只用灰度 NCC —— 否则 LLR 恒为
+        # 0，会把每个候选都判成"不像目标"。
         self.color_sep = 0.5 * float(np.abs(self.fg - self.bg).sum())
 
     @property
     def color_ok(self):
-        """颜色模型是否携带信息（不携带时所有颜色判据自动旁路）"""
+        """颜色模型是否携带信息（不携带时所有颜色判据自动旁路）。"""
         return self.color_sep >= self.sep_min
 
     @property
     def _tmpl_textured(self):
-        """当前工作模板是否**有纹理**（去均值后的标准差）。
-        """
+        """当前工作模板是否**有纹理**（去均值后的标准差）。"""
         if self.template is None:
             return False
         return float(self.template.std()) >= 6.0
 
     def border_edge(self, bgr, box, band=2):
-        """框的**边框**压在物体轮廓上的程度（归一化 Sobel 幅值在框边 1~2px 上的均值）。
-        """
+        """框的**边框**压在物体轮廓上的程度（归一化 Sobel 幅值在框边 1~2px 上的均值）。"""
         x, y, w, h = [int(round(v)) for v in box]
         H, W = bgr.shape[:2]
         x0, y0 = max(0, x), max(0, y)
@@ -916,7 +1018,7 @@ class TargetTracker:
         return float(ring.mean()) if ring.size else 0.0
 
     def _box_llr_q(self, bgr, box, q):
-        """框内 LLR 的 q 分位（掩膜阈值锚："目标自己有多像目标"）"""
+        """框内 LLR 的 q 分位（掩膜阈值锚："目标自己有多像目标"）。"""
         if self.fg is None:
             return None
         x, y, w, h = [int(round(v)) for v in box]
@@ -928,15 +1030,15 @@ class TargetTracker:
         return float(np.percentile(llr, q * 100.0))
 
     def measure_extent(self, bgr, box, margin=0.35):
-        """
-        【颜色比例 + 边界（掩膜连通域）+ 物体边缘】量目标实际占多大。
-        """
+        """返回 (外接框, 填充率 fill, 面积, 质心, 框内目标像素占比 fit, 边缘密度) 或 None。"""
         H, W = bgr.shape[:2]
         x, y, w, h = [int(round(v)) for v in box]
         gx, gy = int(w * margin), int(h * margin)
         # ROI 的**上限由存储的目标基准尺寸决定**，不由当前框决定：否则框一涨 ROI 就跟着涨， 掩膜在更大的范围里再连到更多背景，正反馈棘轮（d.mp4 紫伞行人：ROI 跟着框涨，
+        # 掩膜把湿路面的紫色倒影连进来，20 帧吞掉半屏 -> 分数崩 -> 误判丢失）。
         if self.ref_area is not None:
             # 真增长（_grow_streak 高）时把 ROI 上限也一起放开，否则 ROI 卡在旧基准上， 掩膜根本看不到已经长大的目标 -> 测量值偏小 -> 框永远追不上（实测：
+            # 6%/帧增长时框/真值比从 0.96 掉到 0.45）。棘轮由 border_edge + 面积闸门 兜底，不靠死卡 ROI。
             roi_k = 1.6
             if getattr(self, "_grow_streak", 0) >= 2:
                 roi_k = 1.6 + 0.35 * min(4, self._grow_streak)
@@ -952,6 +1054,7 @@ class TargetTracker:
         llr = self.llr_map(hsv)
         lo, hi = float(llr.min()), float(llr.max())
         color_use = (hi - lo) >= 1e-3
+        # 边缘证据：Sobel 幅值（灰度），按 95 分位归一化，避免被个别强边缘压倒
         gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY)
         gg = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
         gh = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -959,6 +1062,8 @@ class TargetTracker:
         ehi = float(np.percentile(edge, 95)) or 1.0
         edge = np.clip(edge / ehi, 0.0, 1.0)
         if color_use:
+            # 颜色够用时只用颜色（把边缘 OR 进来会给目标内部添纹理噪声）。 阈值不用 OTSU：OTSU 在整个 ROI 上找最优分割，ROI 里背景占多数时阈值会被 改成用**存储基准框内的 LLR
+            # 分位数**当阈值：目标自己有多"像目标"，
             if self.ref_llr_q is not None:
                 thr = self.ref_llr_q
                 mask = ((llr >= thr).astype(np.uint8)) * 255
@@ -967,6 +1072,7 @@ class TargetTracker:
                 u8 = (ev * 255.0).astype(np.uint8)
                 _, mask = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         else:
+            # 颜色没信息（灰色/低饱和目标）-> 梯度是唯一的轮廓线索。 用连续幅值而不是二值化：噪声场景里 95 分位很高，二值化会把掩膜清空。
             ev = edge
             u8 = (ev * 255.0).astype(np.uint8)
             _, mask = cv2.threshold(u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -983,13 +1089,13 @@ class TargetTracker:
         mask = cv2.bitwise_or(mask, cv2.bitwise_not(ff))    # 内部空洞补上
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-        n, _lab, stats, cent = cv2.connectedComponentsWithStats(mask, 8)
+        n, stats, cent, lab_at = _rle_cc(mask)
         if n <= 1:
             return None
         # 取**覆盖当前框中心**的那个连通域（不是"最大"的）：ROI 里还可能有别的同类色物体， 最大连通域可能整个跑到旁边去（实测掩膜会连到湿路面/背景上）。
         lx, ly = int(clamp(x + w / 2.0 - x0, 0, mask.shape[1] - 1)), \
             int(clamp(y + h / 2.0 - y0, 0, mask.shape[0] - 1))
-        lid = int(_lab[ly, lx])
+        lid = lab_at(ly, lx)
         if lid == 0:                     # 框心不在掩膜里 -> 退而求其次：与框重叠最大的连通域
             best_ov, lid = 0, 0
             bx0, by0 = max(0, x - x0), max(0, y - y0)
@@ -1009,19 +1115,19 @@ class TargetTracker:
             return None
         fill = area / float(mw * mh)
         cx_m, cy_m = float(cent[i][0]) + x0, float(cent[i][1]) + y0
+        # 颜色比例：当前框内有多少像素被判成"像目标"（判断框是不是太松的直接依据）
         ix0, iy0 = max(0, x - x0), max(0, y - y0)
         ix1, iy1 = min(mask.shape[1], x + w - x0), min(mask.shape[0], y + h - y0)
         fit_in_box = (float((mask[iy0:iy1, ix0:ix1] > 0).sum()) / max(1.0, w * h)
                       if ix1 > ix0 and iy1 > iy0 else 0.0)
+        # 边缘密度：框内强边缘像素占比。空框/黑边 ≈ 0，真目标结构边界明显 -> 用它挡假跟
         eb = edge[iy0:iy1, ix0:ix1] if ix1 > ix0 and iy1 > iy0 else None
         edge_den = float((eb > 0.35).mean()) if eb is not None and eb.size else 0.0
         return ((float(mx + x0), float(my + y0), float(mw), float(mh)), float(fill),
                 float(area), (cx_m, cy_m), float(fit_in_box), float(edge_den))
 
     def _fit_size(self, box, extent):
-        """
-        用掩膜的几何范围 + 颜色比例来修框大小与框心（返回新框或 None=保持不动）。
-        """
+        """颜色比例判定（多道闸：掩膜面积比 / 绝对长宽比 / 填充率 / 边缘密度 / 黑边 / 单帧步长 …，。"""
         mbox, fill, marea, centroid, fit_in_box, edge_den = extent
         bx, by, bw, bh = box
         if fill < self.fill_min or marea < 12:
@@ -1036,19 +1142,24 @@ class TargetTracker:
                 return None
             if self.ref_fill is not None and fill < 0.5 * self.ref_fill:
                 return None
+        # **边缘密度闸门**：框里几乎没有边缘 -> 这里没有物体（空框、黑边、无纹理区）。
         if edge_den < self.edge_min and self._last_border_edge < self.edge_min:
             return None
         if not self._valid_ok(mbox):
             return None
         ratio = marea / max(1.0, bw * bh)
+        # **面积比闸门（收紧，修"尺寸被背景掩膜一帧推大 -> 模板崩 -> 冻结"）**： 真实目标的 ~2.2 倍。原来上限 2.2 恰好卡在边界上：只要某一帧掩膜稍小
         if ratio < 0.3 or ratio > 1.6:
             return None
+        # **绝对长宽比闸门（锚 = 用户初始框，修"目标莫名其妙丢失"的根本一条）**：
         ar_init = mbox[2] / max(1.0, mbox[3])
         if not (0.75 * self.init_aspect <= ar_init <= 1.35 * self.init_aspect):
             return None
         # 同理，**掩膜外接框的填充率**相对初始框不能塌：横向细带 fill 会很低。
         if self.ref_fill is not None and fill < 0.45 * self.ref_fill:
             return None
+        # **单帧尺寸变化硬上限**：无论 _grow_streak 如何，一帧内尺寸变化不许超过 mask_step_max（默认 12%）。真目标不可能一帧变大 12%（那要瞬间走近一半）。
+        # 这条是独立于掩膜面积比之外的最后一道闸，专挡"掩膜突然连到背景"的跳变。
         if abs(mbox[2] - bw) > self.mask_step_max * bw or \
                 abs(mbox[3] - bh) > self.mask_step_max * bh:
             return None
@@ -1062,10 +1173,12 @@ class TargetTracker:
         if math.hypot(centroid[0] - (bx + bw / 2.0), centroid[1] - (by + bh / 2.0)) \
                 > 0.6 * max(bw, bh):
             return None
+        # 单帧尺寸变化上限：默认 mask_step（6%，挡"一帧就大一圈"的假测量）。
         st = self.mask_step
         ema = self.size_ema
         if getattr(self, "_grow_streak", 0) >= 2:
             # 持续真增长：步长放宽 + EMA 加快。二者缺一不可—— 只放宽步长，EMA=0.15 仍把每帧实际变化压到 2.7%，追不上 6%/帧； 只加快 EMA，步长又卡在 6%。实测这样改后
+            # 6%/帧增长能跟住。
             st = max(st, self.step_grow)
             ema = max(ema, self.ema_grow)
         tw = (1 - ema) * bw + ema * mbox[2]
@@ -1075,6 +1188,7 @@ class TargetTracker:
         tw = float(clamp(tw, self.min_box, 0.98 * 1e4))
         th = float(clamp(th, self.min_box, 0.98 * 1e4))
         # **绝对放大上限**：相对**用户选定的初始框**，不置信时最多放大 grow_hi 倍。 挡住"掩膜系统性偏大把框越推越大"（d.mp4 湿路面紫倒影实测推到 5.5 倍，模板跟着 烂掉 ->
+        # 分数崩 -> 误判丢失）。目标真的走近时分数高，由 update() 的置信帧 打开 _grow_ok 放宽这条上限。
         if self.init_area and not self._grow_ok:
             cap = self.grow_hi * self.init_area
             if marea > cap or tw * th > cap * 1.3:
@@ -1099,8 +1213,7 @@ class TargetTracker:
         return float(np.mean(self.llr_map(sub)))
 
     def _box_llr_mean(self, bgr, box):
-        """框内平均 LLR（目标似然）。用于**改尺寸前的颜色核对**。
-        """
+        """框内平均 LLR（目标似然）。用于**改尺寸前的颜色核对**。"""
         if self.fg is None:
             return 0.0
         H, W = bgr.shape[:2]
@@ -1113,10 +1226,9 @@ class TargetTracker:
             return 0.0
         return float(np.mean(self.llr_map(cv2.cvtColor(sub, cv2.COLOR_BGR2HSV))))
 
+    # ---------------- 颜色构成特征（"颜色配方"）----------------
     def build_recipe(self, bgr, box):
-        """
-        统计框内**占比最大的前 K 种颜色**及其相对占比，存成"颜色配方"。
-        """
+        """统计框内**占比最大的前 K 种颜色**及其相对占比，存成"颜色配方"。"""
         if self.fg is None:
             return
         H, W = bgr.shape[:2]
@@ -1136,6 +1248,8 @@ class TargetTracker:
             return
         hist = np.bincount(hb[m], minlength=self.HS_H).astype(np.float64)
         total = float(hist.sum()) + 1e-9
+        # **合并相邻 H 桶**：同一种颜色常正好压在 H 档边界上（如紫 H≈128 会同时 落进桶 7 和 8），零散地存两项会让占比随光照抖动。按权重贪心地把相邻桶
+        # 并成一个"颜色"，既稳定又保留"上紫下黄 7:3"这类真正的多色配比。
         merged = {}                              # 代表桶 -> 权重
         for c in np.argsort(hist)[::-1]:
             if hist[c] <= 0:
@@ -1154,10 +1268,7 @@ class TargetTracker:
         self.color_recipe = rec if rec else None
 
     def recipe_sim(self, hsv, box):
-        """候选框的**颜色构成**与存储配方的相似度（0..1）。
-            做法：算候选框内（只取有颜色像素）的颜色直方图，取前 K 种颜色，
-            用直方图**交集**相似度 Σ min(a_i, b_i) 比对配方 —— 对"紫多黄少"这种
-        """
+        """候选框的**颜色构成**与存储配方的相似度（0..1）。"""
         if self.color_recipe is None:
             return None, 0
         H, W = hsv.shape[:2]
@@ -1177,6 +1288,7 @@ class TargetTracker:
         hist = np.bincount(hb[m], minlength=self.HS_H).astype(np.float64)
         total = float(hist.sum()) + 1e-9
         hp = hist / total
+        # 把候选的每个 H 桶**归给最近的配方色**（桶间环形距离 ≤1 才算数，吸收运动 模糊/压缩的色调漂移）；这样每个桶只被一个配方色消费，占比不会重复计算。
         acc = np.zeros(len(self.color_recipe))
         used = np.zeros(self.HS_H, bool)
         for c in range(self.HS_H):
@@ -1192,19 +1304,28 @@ class TargetTracker:
                             zip(self.color_recipe, acc)]))
         dev = float(np.sum([abs(a - w) for (_, w), a in
                             zip(self.color_recipe, acc)]))
+        # 未归属到任何配方色的杂色也算偏差，防止"异色块/单色块"蒙混
         dev += float(hp[~used].sum())
+        # 配比吻合度：主色不同/配比颠倒时 dev 大 -> 压低总分。
+        # 0.6 是**开发系数**（dev 每相差 1.0，分数最多压掉 60%）—— 实测区分度：
+        # 真目标 0.975 / 配比颠倒 0.323 / 对半 0.623 / 纯单色 0.432，阈值 0.55 取在上下限之间。
         ratio_fit = max(0.0, 1.0 - 0.6 * dev)
         return float(hit * ratio_fit), n
 
     def init(self, gray, bgr, box):
+        # **先夹到真实像素区**：拖框/点选若把黑边圈进来，初始框本身就是错的（黑边没有内容）。
+        box = self._clamp_valid(box, gray.shape[1], gray.shape[0])
+        if box[2] < 8 or box[3] < 8:
+            return False
         tmpl = self._grab(gray, box)
         if tmpl is None:
             return False
         self.box = np.array(box, np.float32)
         self.init_area = float(box[2] * box[3])   # 用户选定框的面积 = 绝对放大上限的锚
-        # **用户选定框的"几何锚"（不可漂移）**：这是 _fit_size 的绝对长宽比闸门基准。 为什么必须单独记：原来只用 ref_aspect，而 ref_aspect 每帧都从**当前框**学
-        self.init_w, self.init_h = float(box[2]), float(box[3])
+        # **用户选定框的"几何锚"（不可漂移）**：_fit_size 的绝对长宽比闸门基准。不能用 ref_aspect —
+        # 那个每帧从**当前框**学，会跟着漂。
         self.init_aspect = float(box[2]) / max(1.0, float(box[3]))
+        # **初始框内的平均 LLR（目标似然）—— "目标颜色分布特征"的标尺**。
         self.llr_init = None
         self.template = self._prep(tmpl)
         self.vel[:] = 0.0
@@ -1213,21 +1334,26 @@ class TargetTracker:
         self.state, self.lost_since = self.STATE_TRACK, None
         self.fg = self.bg = None
         self._update_model(bgr, self.box)
+        # 模型就绪后**立刻**在初始框上量一次目标似然，作为后续"框还在不在目标上"的 绝对标尺（见 llr_init 声明处的注释）。
         self.llr_init = self._box_llr_mean(bgr, self.box)
         self.build_recipe(bgr, self.box)     # 存目标的"颜色配方"（占比最大的前 K 色）
+        # attempt14：把出生锚冻结下来（灰度模板 + 颜色配方）—— 之后只有双锚都认账才允许学习
+        self._freeze_anchors(gray, bgr, self.box)
+        self.n_unanchor = 0
+        _sp = self._sp_feats(bgr)
+        self.sp_desc0 = None if _sp is None else _sp[1].copy()   # 空间描述子的出生锚
         self.prev_gray, self.prev_box = gray.copy(), self.box.copy()
         self._last_border_edge = 1.0   # 首帧无历史，默认放行（真值框由用户保证）
         self._grow_streak = 0
         self._last_peak = None          # 上一帧被接受的峰值（时间稳定性判据）
+        # 云台视角补偿：wt_prev 是上一帧 view 的云台角 (pan,tilt,deg)，view 尺寸用 (W,H) 告诉 _warp_compensate
+        # 像素/度的比例。set_view_angles 由主循环每帧调用。
         self._wt_prev = None
         self._view_wh = (float(gray.shape[1]), float(gray.shape[0]))
         return True
 
     def set_view_angles(self, pan=None, tilt=None, wh=None, ppd=None):
-        """告知跟踪器：**本帧 view 画面**对应的云台绝对角（度）与画面尺寸。
-            必须每帧调（主循环在 cam.render 之后）。有了它，update() 才能把上一帧
-            框从"旧视角坐标系"换算到"本帧视角坐标系"—— 见 _warp_compensate。
-        """
+        """告知跟踪器：**本帧 view 画面**对应的云台绝对角（度）与画面尺寸。"""
         if pan is None:
             self._view_ang = None
             self._wt_prev = None
@@ -1239,10 +1365,7 @@ class TargetTracker:
         self._view_ang = (float(pan), float(tilt if tilt is not None else 0.0))
 
     def _backward_ok(self, gray, box):
-        """互一致性：把"当前帧候选框里的外观"当模板，回上一帧的原位置找一次。
-
-        掺了背景的模板在这一步会露馅（上一帧那个位置还没有那块背景）。
-        """
+        """互一致性：把"当前帧候选框里的外观"当模板，回上一帧的原位置找一次。"""
         if self.prev_gray is None or self.prev_box is None:
             return True
         tmpl = self._grab(gray, box, pad=True)
@@ -1254,10 +1377,7 @@ class TargetTracker:
         return r is not None and r[1] >= self.bwd_score and r[2] >= self.bwd_psr
 
     def _global_shift(self, gray):
-        """估计相对上一帧的**全局画面运动**（旋转角 + 平移），用于搜索中心预测与去旋转。
-            video_proc40：ORB 旋转估计按 gm_rot_every 降频，复用上一次的旋转角；
-            平移仍每帧用 phaseCorrelate 算（它只 0.5ms，便宜）。
-        """
+        """估计相对上一帧的**全局画面运动**（旋转角 + 平移），用于搜索中心预测与去旋转。"""
         if not self.gm_comp or self.prev_gray is None:
             return 0.0, 0.0, 0.0
         g = gray
@@ -1274,7 +1394,8 @@ class TargetTracker:
                                                     g.astype(np.float32), self._gm_win)
                 if np.isfinite(px) and np.isfinite(py) and resp >= self.gm_min_resp:
                     dx, dy = -px / self.gm_scale, -py / self.gm_scale
-                #   实测会把目标甩出搜索窗、触发更多 search_region，反而更慢；
+                # attempt12：ORB 旋转估计每 gm_rot_every 帧做一次，跳过帧 rot=0.0。 原因：复用上一次的旋转角去做 warpAffine 反旋转会引入"错角"，
+                # 实测会把目标甩出搜索窗、触发更多 search_region，反而更慢； 小旋转(<gm_rot_min=0.35°) 时 rot=0 与原行为一致。
                 self._gm_rot_tick = (self._gm_rot_tick + 1) % self.gm_rot_every
                 if self._gm_rot_tick == 0:
                     rot = self._estimate_rotation(p, g)
@@ -1309,17 +1430,20 @@ class TargetTracker:
                                              ransacReprojThreshold=2.0)
         if M is None or inl is None or int(inl.sum()) < self.gm_orb_min:
             return 0.0
+        # 符号：estimateAffinePartial2D(prev_pts, cur_pts) 返回的 M 是"把 cur 映回 prev" 的方向，所以取角度后要**取反**才是"画面从 prev 到
         # cur 转过的角度"（实测验证： 真值 -2° 时 arctan2 给 +2.09°）。
         return float(-np.degrees(np.arctan2(M[1, 0], M[0, 0])))
 
     def update(self, gray, bgr, dt):
-        """跟踪一帧，返回 (ok, box, score, state)"""
+        """跟踪一帧，返回 (ok, box, score, state)。"""
         if self.template is None or self.box is None:
             return False, None, 0.0, self.STATE_LOST
         if self.state == self.STATE_LOST:
             self.missing += 1
             return False, self.box.copy(), self.score, self.state
+        # 进入正常跟踪路径：本帧位置由帧间 NCC 定位 -> 画框用蓝色
         self.src = "ncc"
+        Wf, Hf = float(gray.shape[1]), float(gray.shape[0])   # 提前取，后面几条早退分支也要用
 
         # ⓪ **云台自身运动的"前馈"补偿（修"画面动、框不动然后丢"）** 但**搜索窗必须按这个量前馈**，否则：一次 5° 的云台动作就让目标在画面里
         self._last_dt = float(dt)
@@ -1338,14 +1462,17 @@ class TargetTracker:
 
         # ① 单尺度定位（最便宜，先解决"在哪"） **关键：搜索窗中心要补偿"全局画面运动"**（云台转动/手持平移）。
         gdx, gdy, grot = self._global_shift(gray)
+        # **去重**：相位相关 gdx/gdy 测的是"整幅画面的位移"，其中**已经包含**云台自身的
         gimbal_active = (gpan_dx != 0.0 or gpdy != 0.0)
         if gimbal_active:
             gdx = gdy = 0.0
+            # 云台正在主动转时，速度估计是以"view 位移"为基的，含云台分量，压掉它
             vpx = vpy = 0.0
         else:
             vpx, vpy = self.vel[0] * dt, self.vel[1] * dt
         cx = self.box[0] + self.box[2] / 2.0 + vpx + gdx + gpan_dx
         cy = self.box[1] + self.box[3] / 2.0 + vpy + gdy + gpdy
+        # **渐进扩窗（修"跑出搜索窗就永久冻结/框不跟手"）**：搜索半径只有 search_pad_min（默认 56px）。目标单帧表观位移一旦超过它（手持大幅晃动 +
         search_ratio = self.search_ratio
         if self.missing > 0:
             search_ratio = self.search_ratio * (1.0 + self.search_grow * self.missing)
@@ -1353,12 +1480,14 @@ class TargetTracker:
                         search_ratio, rot=grot)
         best = None if r is None else (r[1], r[2], r[0][0], r[0][1],
                                        self.box[2], self.box[3])
+        # ② 尺度：**只有一条路** —— 前景掩膜 + 边界（连通域外接框）+ 颜色比例
         self._tick = getattr(self, "_tick", 0) + 1
         do_size = (self._tick % self.size_every == 0)
         if do_size or getattr(self, "_ext_cache", None) is None:
             self._ext_cache = self.measure_extent(bgr, self.box) if self.fg is not None else None
         extent = self._ext_cache
         if best is None and self._tick % self.refine_every == 0:
+            # 位置都没找到：只在当前尺度上再搜一次大窗（不再做多尺度扫描）
             rr = self._match(gray, self.template, (cx, cy),
                              (self.box[2], self.box[3]), min(0.8, self.search_ratio * 2))
             if rr is not None:
@@ -1368,29 +1497,44 @@ class TargetTracker:
             self.missing += 1
             if self.missing >= self.lost_after and self.state != self.STATE_LOST:
                 self._mark_lost(getattr(self, "_now", 0.0))
+            # 被拒的帧也要保证框在有效区内（否则一旦框坏了没人修）
+            self.box = self._clamp_valid(self.box, Wf, Hf)
             return False, self.box.copy(), self.score, self.state
 
         score, psr, px, py, tw, th = best
         # 只有"可接受"的匹配才允许更新位置/速度/尺度。分数太低说明这一帧根本没匹配上 但豁免必须**只对有纹理的模板**生效：平坦区/黑边上的归一化相关是退化的
         strong = score >= self.score_psr_free and self._tmpl_textured
+        # **次级豁免（修真实视频里"分数稳在 0.7 却被 PSR 一票否决 -> 无突变丢失"）**：
         d_peak = math.hypot((px + tw / 2.0) - cx, (py + th / 2.0) - cy)
+        # 时间稳定性：本帧峰值与本 tracker 上一帧**接受的**峰值位置差。锁住的目标每帧 只动 1~2px；背景乱咬/落到黑边则会在帧间大跳。用它当与 PSR 正交的第二证据，
+        # 比"离预测中心的距离"更靠谱 —— d_peak 在框短暂冻结时会累积变大，而稳定性不会。
         pp = getattr(self, "_last_peak", None)
         peak_stable = (pp is None) or (math.hypot((px + tw / 2.0) - pp[0],
                                       (py + th / 2.0) - pp[1]) <= self.soft_jump * max(tw, th))
+        # **无论接不接受都记录本帧匹配峰值**：稳定性判据要的是"匹配位置是否在帧间稳定"， 而不是"上次被接受的位置"。只有"接受时才更新"会让连续几帧被拒后基准变旧、 稳定性误判为
         # False，把本来稳定的匹配也拒掉 -> missing 一路累到 lost（实测 d.mp4 f141-145 峰值稳定在 639 却被判不稳）。
         self._last_peak = (px + tw / 2.0, py + th / 2.0)
         soft = (score >= self.score_soft and self._tmpl_textured
                 and (d_peak <= self.soft_pull * max(tw, th) or peak_stable))
         keep_p = (score >= self.score_keep and psr >= self.psr_keep)
+        # **第三条通道：慢跟随（修"框不跟手/框不动"的根本一刀）** —— `strong`(≥0.85) / `soft`(≥0.68) / `keep`(psr≥2.0) **三条全不满足**，
+        # 判据：分数≥score_keep（说明峰确实比周围高）且**峰值帧间稳定**（连续帧都落在
         slow = (score >= self.score_keep and peak_stable and self._tmpl_textured)
         accepted = strong or soft or keep_p or slow
         slow_move = slow and not (strong or soft or keep_p)   # 仅slow通道时降速跟随
-        # **跳变闸门（修"框不跟手"的直接一刀）**：实测 d.mp4 f76 一帧内框从原位置 帧间真实目标的表观位移不会超过一个物理上限（经验：≤0.35·框尺寸 + 速度项），
+        # ---- attempt14：颜色身份连续 ≥2 帧不过 -> 本帧位置不予采纳 ----
+        # 光"抬高接纳门槛"拦不住背景（它的 NCC 分数本来就高）；必须直接不采纳位置，累计 missing
+        # → 12 帧判丢 → 走已验证的配方重捕。连续 2 帧是为了滤掉单帧瞬时干扰。
+        if self._unanchor_run >= 2:
+            accepted = False
+            slow_move = False
+        # 跳变闸门（修"框不跟手"的直接一刀）：实测 d.mp4 f76 一帧内框从原位置 帧间真实目标的表观位移不会超过一个物理上限（经验：≤0.35·框尺寸 + 速度项），
         pred_c = np.array([cx, cy], np.float32)          # 搜索中心 = 上一帧框心 + 预测
         peak_c = np.array([px + tw / 2.0, py + th / 2.0], np.float32)
         jump = float(np.hypot(*(peak_c - pred_c)))
         jump_cap = self.jump_cap * max(tw, th)           # 允许的单帧最大跳变
         if jump > jump_cap and not strong:
+            # 咬错了：把峰值拉回到"预测中心 + 朝峰值方向的 jump_cap 步长"上， 分数相应打折（不足信），但仍允许一次有限移动 —— 不冻结。
             u = (peak_c - pred_c) / max(1e-6, jump)
             peak_c = pred_c + u * jump_cap
             px, py = peak_c[0] - tw / 2.0, peak_c[1] - th / 2.0
@@ -1400,10 +1544,12 @@ class TargetTracker:
             self.missing += 1
             if self.missing >= self.lost_after and self.state != self.STATE_LOST:
                 self._mark_lost(getattr(self, "_now", 0.0))
+            self.box = self._clamp_valid(self.box, Wf, Hf)
             return True, self.box.copy(), score, self.state
         new_c = np.array([px + tw / 2.0, py + th / 2.0], np.float32)
         old_c = self.box[:2] + self.box[3 - 1:] / 2.0
         if slow_move:
+            # 仅慢通道：只走"旧框心 -> 新峰"这一段的一定比例。若峰是对的，几帧内贴上； 若峰略偏，也不至于一步冲错。**速度项不更新**（这帧位置证据不足信， 用它估速度会污染下一帧的搜索中心预测）。
             new_c = old_c + self.slow_gain * (new_c - old_c)
         elif dt > 1e-4:
             dv = (new_c - old_c) / dt
@@ -1413,7 +1559,9 @@ class TargetTracker:
             self.vel = np.clip(self.vel, -vlim, vlim)
 
         old_h = float(self.box[3])
+        # _fit_size 的"边缘密度闸门"要区分"空框"和"大而平坦的真目标"，靠的就是 当前框的**边框**边缘密度：先算好放进来（见 _fit_size 里那条注释）。
         self._last_border_edge = self.border_edge(bgr, self.box)
+        # 尺寸只有一个来源：掩膜几何范围 + 颜色比例（_fit_size）。掩膜拿不到或闸门不过 -> **冻结原尺寸**，不做任何自适应。绝不退回"NCC 尺度谱"（那条路已删除）。
         fitted = self._fit_size(self.box, extent) if extent is not None else None
         if fitted is not None:
             # **边界贴合判据**：新框的边框边缘密度不能明显低于旧框（0.75 倍以内）， 否则说明新框涨进了平坦背景、或缩进了目标内部 —— 一律不采纳（冻结尺寸）。
@@ -1426,6 +1574,7 @@ class TargetTracker:
                 color_ok_size = llr_new >= self.llr_floor_frac * self.llr_init
             else:
                 color_ok_size = True
+            # **质心牵引（cent_pull）只在与 NCC 峰一致时才允许**：
             mcx, mcy = extent[3]
             pull_ok = (math.hypot(mcx - (px + tw / 2.0), mcy - (py + th / 2.0))
                        <= 0.5 * max(tw, th))
@@ -1441,15 +1590,9 @@ class TargetTracker:
                 self.box = np.array([px, py, self.box[2], old_h], np.float32)
         else:
             self.box = np.array([px, py, self.box[2], old_h], np.float32)
-        Wf, Hf = float(gray.shape[1]), float(gray.shape[0])
-        if self.valid is not None:
-            vx0, vy0, vx1, vy1 = self.valid
-        else:
-            vx0, vy0, vx1, vy1 = 0.0, 0.0, Wf, Hf
-        self.box[0] = float(clamp(self.box[0], vx0, max(vx0, vx1 - self.box[2])))
-        self.box[1] = float(clamp(self.box[1], vy0, max(vy0, vy1 - self.box[3])))
-        self.box[2] = float(min(self.box[2], vx1 - vx0))
-        self.box[3] = float(min(self.box[3], vy1 - vy0))
+        # 框夹回**真实像素**范围内（不是整个画面）：黑边里没有内容，框进去就是假跟
+        self.box = self._clamp_valid(self.box, Wf, Hf)
+        # **框长宽比硬夹（相对用户初始框，±25%）——防"慢慢横过来"的最后一道锁**：
         bw_, bh_ = float(self.box[2]), float(self.box[3])
         if bw_ > 1.0 and bh_ > 1.0:
             ar_cur = bw_ / bh_
@@ -1460,10 +1603,14 @@ class TargetTracker:
                 area_ = bw_ * bh_
                 nbw = math.sqrt(area_ * ar_tgt)
                 nbh = area_ / max(1e-6, nbw)
+                # 保持中心不变
                 ccx, ccy = self.box[0] + bw_ / 2.0, self.box[1] + bh_ / 2.0
                 self.box[2], self.box[3] = float(nbw), float(nbh)
                 self.box[0] = float(ccx - nbw / 2.0)
                 self.box[1] = float(ccy - nbh / 2.0)
+        # ★上面这些步骤（尤其长宽比硬夹）都会重设宽高并保持中心 —— 能把刚夹好的框重新推出
+        #   有效区。所以**最后必须再夹一次**（详见 _clamp_valid）。
+        self.box = self._clamp_valid(self.box, Wf, Hf)
         self.score, self.psr = score, psr
 
         patch = self._grab(bgr, self.box, pad=True)
@@ -1471,47 +1618,92 @@ class TargetTracker:
         if patch is not None:
             llr_val = self.llr_of(cv2.cvtColor(patch, cv2.COLOR_BGR2HSV),
                                   (0, 0, patch.shape[1], patch.shape[0]))
+        # ---- attempt14：与两个"出生锚"核验身份 ----
+        self.s_t, self.s_r = self._anchor_scores(gray, bgr, self.box, patch)
+        ok_r = True if self.s_r is None else (self.s_r >= self.anchor_r_min)
+        # ★s_t 的**授权条件**：只在"框面积与出生锚相差 ±11% 以内"时才拿它当判据 —— 灰度相关对
+        #   尺度极敏感（实测缩放 10% 就掉到 0.55、40% 掉到 0.2，而目标明明跟得好好的），给绝对
+        #   阈值必然假报警；反过来"内容被换成背景"时尺寸基本不变，那才是它该抓的。
+        #   身份主判据交给尺度无关的 s_r（实测全程 1.000）。
+        sz_now = float(self.box[2] * self.box[3])
+        scale_stable = (self.anchor_area is None
+                        or 0.90 <= sz_now / max(1e-6, self.anchor_area) <= 1.11)
+        ok_t = (not scale_stable) or self.s_t is None or (self.s_t >= self.anchor_t_min)
+        self.anchored = bool(ok_t and ok_r)
+        # **位置闸门只认颜色（s_r）**：s_t 随目标外观演化会一路衰减、且对尺度极敏感，当位置判据
+        # 只会误杀好目标 —— 它只保留"学不学"的发言权（anchored）。
+        self.id_ok = bool(ok_r)
+        if not self.id_ok:
+            self.n_unanchor += 1
+            self.src = "unanchor"     # 画框转黄：颜色身份不过 -> 不采纳位置
+        self._unanchor_run = (self._unanchor_run + 1) if not self.id_ok else 0
+        # ---- attempt14 观测：空间特征（只算 + 写 CSV，**不参与任何判决**）----
+        self.sp_dlt = self.sp_dinv = self.sp_ddir = None
+        self.sp_clip = None
+        try:
+            _sp = self._sp_feats(bgr)
+            if _sp is not None:
+                self.sp_dlt, self.sp_clip = _sp[0], _sp[2]
+                if self.sp_desc0 is not None:
+                    self.sp_dinv = float(np.abs(_sp[1][:, :3] - self.sp_desc0[:, :3]).sum())
+                    self.sp_ddir = float(np.abs(_sp[1][:, 3:] - self.sp_desc0[:, 3:]).sum())
+        except Exception:
+            pass                          # 观测失败绝不许影响跟踪
         near_edge = (self.box[0] < self.edge_margin * Wf or self.box[1] < self.edge_margin * Hf
                      or self.box[0] + self.box[2] > (1 - self.edge_margin) * Wf
                      or self.box[1] + self.box[3] > (1 - self.edge_margin) * Hf)
+        # 与上面 accepted 同一套豁免：小窗/小目标上 PSR 会被低估，高 NCC 分数即可信。 _tmpl_textured 防止平坦模板上的虚假高分被豁免（见 _tmpl_textured
+        # 注释）。
         strong2 = score >= self.score_psr_free and self._tmpl_textured
         # **confident 拆成两个用途**（修"目标走近变大后丢失"）：
         conf_score = strong2 or (score >= self.score_hi and psr >= self.psr_hi)
         conf_model = conf_score and not near_edge
         conf_size = conf_score
         confident = conf_model          # 兼容原有引用
+        # **keep 也要认 soft 证据**：soft（分数够 + 纹理 + 峰值稳定/贴近预测）是"这一帧 确实跟住了"的合法证据，与 strong 只是强度不同。不认它 -> 连续 soft 帧上
         # missing 不减、12 帧后仍判 lost（实测 d.mp4 f135-145 就是这种情况）。
         keep = strong2 or soft or slow or (score >= self.score_keep and psr >= self.psr_keep)
+        # 颜色没信息时（纯灰/同色目标）颜色判据自动旁路，只靠 NCC+PSR
         llr_ok = (not self.color_ok) or llr_val >= self.llr_min
         # **模板/模型更新的颜色守门（绝对基准）**：llr_min=0.02 太低，实测框滑到湿路面 **最终执行环节**。所以模板更新必须额外过一道**绝对**闸门：框内 LLR 不能低于
         if self.llr_init is not None and self.llr_init > 0.05:
             tmpl_color_ok = (llr_val >= self.llr_floor_frac * self.llr_init)
         else:
             tmpl_color_ok = True
+        # attempt14：只有**双锚都认账**时才允许更新滚动模板 / 颜色模型
+        # （原来只看 llr 颜色闸门，会被背景"熬"过去 —— 慢慢把背景学成目标）
+        learn_ok = bool(self.anchored and tmpl_color_ok)
 
         if keep:
             # 模板更新条件从 confident(分数>=0.70) 放宽到 keep(>=0.50)： 防污染由 _backward_ok（互一致性：当前外观必须能匹配回上一帧的位置）负责，
             self._bwd_tick = (self._bwd_tick + 1) % self.bwd_every
             bwd_ok = (self._bwd_tick != 0) or self._backward_ok(gray, self.box)
-            if keep and llr_ok and tmpl_color_ok and patch is not None and bwd_ok:
+            # learn_ok：双锚核验 + 绝对颜色闸门（见上面的注释）。跑掉这道的帧 外观已经不可能是目标，绝不混进模板——这是"莫名其妙丢失"的最后一道防线。
+            if keep and llr_ok and learn_ok and patch is not None and bwd_ok:
                 new = self._prep(self._grab(gray, self.box, pad=True))
                 old_t = self.template
                 if old_t.shape != new.shape:      # 尺寸变了先缩放旧模板再混合（保住历史外观）
                     old_t = cv2.resize(old_t, (new.shape[1], new.shape[0]),
                                        interpolation=cv2.INTER_LINEAR)
                 self.template = 0.85 * old_t + 0.15 * new
-            if llr_ok and tmpl_color_ok:
+            if llr_ok and learn_ok:
+                # 模型更新（HSV 双直方图）本身很贵，且 hist_lr 已是平滑更新， 隔 model_every 帧做一次对模型几乎无影响 -> 按 model_every 降频。
                 # 但**锚点每帧都要更新**（它是丢失后搜索的圆心，不能滞后）。
                 self.anchor_box = self.box.copy()
                 if self._tick % self.model_every == 0:
                     self._update_model(bgr, self.box)
-                    self.build_recipe(bgr, self.box)    # 配方同步刷新
-                    # 颜色比例特征基准：只在**可接受且颜色可信**的帧以很慢的 EMA 更新 （真走近/走远跟得上，一次坏测量拉不动）。条件不能用 confident(0.7)： d.mp4 里分数长期在
+                    # attempt14：这里**故意不再** build_recipe —— 配方是"出生锚"，必须冻结，
+                    # 否则框一漂配方跟着学背景，方案 5 就失效了（见类文档）。
+                    # 颜色比例特征基准：只在**可接受且颜色可信**的帧以很慢的 EMA 更新 （真走近/走远跟得上，一次坏测量拉不动）。条件不能用 confident(0.7)： d.mp4
+                    # 里分数长期在 0.5~0.65，用 confident 会让基准冻在初始值， 框顶到 2.2 倍上限后再也回不去，模板越啃越烂 -> 84 帧后误判丢失。
                     self.ref_llr_q = self._box_llr_q(bgr, self.box, self.ref_q)
+                    # 置信帧才允许突破"相对初始框的绝对放大上限"（真走近时分数高）。 用 conf_size（不排除贴边）：目标在画面边缘长大是常见情形， 原来用 confident（含
+                    # near_edge 否决）会让边缘目标永远长不大。
                     self._grow_ok = bool(conf_size)
                     ex = extent if extent is not None else None
                     if ex is not None:
-                        # 基准由**被验证过的框**驱动（不是由掩膜测量驱动）：否则测量自身的 偏差会把基准一起拖走，棘轮只是变慢。框只有在通过边界贴合判据后才变， 所以用框的面积/长宽比当基准是稳的；fill/edge
+                        # 基准由**被验证过的框**驱动（不是由掩膜测量驱动）：否则测量自身的 偏差会把基准一起拖走，棘轮只是变慢。框只有在通过边界贴合判据后才变，
+                        # 所以用框的面积/长宽比当基准是稳的；fill/edge 用掩膜统计量（偏差小）。
                         a = self.box[2] * self.box[3]
                         asp = self.box[2] / max(1.0, self.box[3])
                         fl, ed = ex[1], ex[5]
@@ -1520,6 +1712,7 @@ class TargetTracker:
                             self.ref_area, self.ref_aspect = a, asp
                             self.ref_fill, self.ref_edge = fl, ed
                         else:
+                            # **真增长 vs 吃背景 的判别**（修"目标走近变大后丢失"）：
                             if marea > self.ref_grow_ok * self.ref_area:
                                 self._grow_streak = getattr(self, "_grow_streak", 0) + 1
                             else:
@@ -1529,6 +1722,7 @@ class TargetTracker:
                             else:
                                 k = self.ref_lr             # 否则慢刹车（防棘轮）
                             self.ref_area = (1 - k) * self.ref_area + k * a
+                            # **ref_aspect 用极慢的固定速率跟，且夹在初始长宽比的窄带内**：
                             ka = 0.02
                             na = (1 - ka) * self.ref_aspect + ka * asp
                             self.ref_aspect = float(clamp(na,
@@ -1543,13 +1737,14 @@ class TargetTracker:
             self.missing += 1
             if self.missing >= self.lost_after and self.state != self.STATE_LOST:
                 self._mark_lost(getattr(self, "_now", 0.0))
+        # prev_gray 只被 _backward_ok（隔 bwd_every 帧用一次）用到，不必每帧整帧拷贝 （720p 一次 copy ≈1MB 带宽）。这里存引用即可 —— 调用方每帧产新的
+        # gray。
         self.prev_gray, self.prev_box = gray, self.box.copy()
         return True, self.box.copy(), score, self.state
 
+    # ---------------- 丢失后重捕获：颜色比例特征 ----------------
     def search_region(self, bgr, gray, center, margin, now):
-        """
-        丢失后重捕获：在 center 周围找目标。要求连续 2 帧命中同一位置才确认。
-        """
+        """主路径（**有颜色信息 + 有颜色配方时**）：在搜索框内寻找**颜色构成符合配方**的。"""
         if self.template is None or self.box is None:
             return None
         H, W = gray.shape[:2]
@@ -1559,10 +1754,12 @@ class TargetTracker:
         x0 = int(clamp(center[0] - rw / 2.0, 0, W - rw))
         y0 = int(clamp(center[1] - rh / 2.0, 0, H - rh))
 
+        # 目标几何过滤闸门（用目标框的宽高比与面积，宽严适中，不针对具体目标）
         tgt_ar = bw / float(bh)
         tgt_area = float(bw * bh)
         use_color = (self.fg is not None and self.color_ok
                      and self.color_recipe is not None)
+        # 本帧重捕获走哪条路径 -> 决定画框颜色：配方（颜色构成）=红，灰度 NCC 兜底=蓝
         self.src = "recipe" if use_color else "ncc"
         best = None
         if use_color:
@@ -1570,6 +1767,7 @@ class TargetTracker:
             if sub_bgr.shape[0] < bh + 2 or sub_bgr.shape[1] < bw + 2:
                 return None
             sub_hsv = cv2.cvtColor(sub_bgr, cv2.COLOR_BGR2HSV)
+            # ① **配方掩膜**：像素色调落在配方的颜色（±1 H 桶，和相似度判据一致）里、 且 S≥40 才算"符合颜色特征"。用配方挑像素比 LLR>0 干净得多：目标色被
             # 点亮，湿路面/反光不会混入。±1 容差很关键——目标色常正好压在 H 档边界上 （如紫 H≈128 会同时落在桶 7/8），只认单桶会把目标切成两半。
             hb = (sub_hsv[..., 0].astype(np.int32) >> 4)
             sm = sub_hsv[..., 1]
@@ -1579,7 +1777,7 @@ class TargetTracker:
                     mm |= (hb == ((b + dh) % self.HS_H))
             mm &= (sm >= 40).astype(np.uint8)
             mm = cv2.dilate(mm, np.ones((5, 5), np.uint8), iterations=1)
-            ncc, lab, stats, cent = cv2.connectedComponentsWithStats(mm, 8)
+            ncc, stats, cent, _lab_at = _rle_cc(mm)
             cands = []                              # (sim, n, angle, box)
             area_cap = 0.5 * rw * rh                # 占搜索区一半以上 = 背景，不是物体
             for i in range(1, ncc):
@@ -1604,6 +1802,7 @@ class TargetTracker:
                 cands.sort(key=lambda t: (-t[0], t[2]))   # 先相似度，再离中心近
                 sim, ncol, ang, (lx, ly, lw, lh) = cands[0]
                 if sim >= self.recipe_min_sim:
+                    # ② **边界闭合闸门**（连通域外接框：真独立物体框外应几乎无目标色）
                     pad = max(2, int(0.10 * min(lw, lh)))
                     qx0 = max(0, int(lx) - pad)
                     qy0 = max(0, int(ly) - pad)
@@ -1622,6 +1821,7 @@ class TargetTracker:
                         best = (sim, sim, float(bx), float(by),
                                 float(lw), float(lh), 1)
         if best is None and not use_color:
+            # 灰度兜底：单尺度灰度 NCC 扫一遍目标框区域
             sub = gray[y0:y0 + rh, x0:x0 + rw]
             if sub.shape[0] < bh + 2 or sub.shape[1] < bw + 2:
                 return None
@@ -1644,9 +1844,22 @@ class TargetTracker:
             self._cand_hits = 0
         self._cand_box = box
         self._cand_hits += 1
+        # 高置信（配方相似度足够高）只需 1 帧即可确认，低置信才要 2 帧， 这样"已经明显找回"的目标不用白等一帧，模糊/刚遮挡完的场景仍防误判。
         need = 1 if best[0] >= self.recipe_confirm_hi else 2
         if self._cand_hits < need:
             return None
+        # 确认恢复
+        # ★★ 只取"在哪里"，**不取"多大"** ★★
+        # 配方掩膜只覆盖目标的**彩色部分**，连通域外接框天然小于真实目标框 —— 直接拿它当尺寸，
+        # 框就会**每次重捕都缩掉一截**（"跳着跳着越来越小"）。所以：**中心**用候选的，
+        # **尺寸沿用丢失瞬间的框**，之后由 _fit_size 的渐进闸门（单帧 ≤12%）慢慢纠正。
+        # 由此建立本程序的不变式：**位置可以跳，尺寸永远不跳**。
+        sw = float(self.box[2]) if self.box is not None else float(box[2])
+        sh = float(self.box[3]) if self.box is not None else float(box[3])
+        ccx, ccy = box[0] + box[2] / 2.0, box[1] + box[3] / 2.0
+        box = np.array([ccx - sw / 2.0, ccy - sh / 2.0, sw, sh], np.float32)
+        # 重捕获回来的框也要夹到真实像素区（原来只夹了搜索窗，恢复的框可以是黑边里的）
+        box = self._clamp_valid(box, W, H)
         self.box = box
         patch = self._grab(gray, box, pad=True)
         if patch is None:
@@ -1660,8 +1873,112 @@ class TargetTracker:
         self.state, self.lost_since, self.lost_box = self.STATE_TRACK, None, None
         self.prev_gray, self.prev_box = gray.copy(), box.copy()
         self._update_model(bgr, box)
+        # ★这里**故意不重设出生锚**（不变式①）：曾加过"高置信重捕→重设出生锚"，结果是每次重捕
+        #   都把初始特征重算一遍，找回来的区域更小就以更小为准 → **逐跳缩水**。
         self.n_recover += 1
         return box.copy(), self.score, self.psr
+
+    # ---------------- attempt14：出生锚 ----------------
+    def _freeze_anchors(self, gray, bgr, box):
+        """把**当前框**的外观冻结成"出生锚"：灰度模板 `template0` + 颜色配方 `color_recipe`。"""
+        g0 = self._grab(gray, box, pad=True)
+        self.template0 = self._prep(g0) if g0 is not None else None
+        self.build_recipe(bgr, box)          # 冻结的配方 = self.color_recipe（此后再不自动刷新）
+        self.s_t = 1.0 if self.template0 is not None else None
+        self.s_r = 1.0 if self.color_recipe is not None else None
+        self.anchor_area = float(box[2] * box[3])
+        self.anchored = True
+        self.id_ok = True
+        self._unanchor_run = 0
+
+    def _anchor_scores(self, gray, bgr, box, patch):
+        """本帧的双锚分数 (s_t, s_r)。"""
+        s_t = None
+        g0 = self._grab(gray, box, pad=True)
+        if g0 is not None and self.template0 is not None:
+            t0 = self.template0
+            if t0.shape != g0.shape:
+                t0 = self._prep(cv2.resize(t0, (g0.shape[1], g0.shape[0]),
+                                           interpolation=cv2.INTER_LINEAR))
+            a = self._prep(g0).ravel()
+            b_ = t0.ravel()
+            na = float(np.sqrt(float(np.dot(a, a))))
+            nb = float(np.sqrt(float(np.dot(b_, b_))))
+            s_t = float(np.dot(a, b_) / (na * nb + 1e-9))
+        s_r = None
+        if patch is not None and self.color_recipe is not None:
+            sr, _ncol = self.recipe_sim(cv2.cvtColor(patch, cv2.COLOR_BGR2HSV),
+                                        (0, 0, patch.shape[1], patch.shape[0]))
+            s_r = None if sr is None else float(sr)
+        return s_t, s_r
+
+    def _sp_feats(self, bgr):
+        """框内颜色集群的**空间**特征（观测用：只算、不参与任何判决）。"""
+        if self.color_recipe is None or self.box is None:
+            return None
+        H, W = bgr.shape[:2]
+        x0 = int(clamp(self.box[0], 0, W - 2))
+        y0 = int(clamp(self.box[1], 0, H - 2))
+        x1 = int(clamp(self.box[0] + self.box[2], x0 + 2, W))
+        y1 = int(clamp(self.box[1] + self.box[3], y0 + 2, H))
+        sub = bgr[y0:y1, x0:x1]
+        hh, ww = sub.shape[:2]
+        if hh < 12 or ww < 12:
+            return None
+        hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+        hb = (hsv[..., 0].astype(np.int32) >> 4)
+        sm = hsv[..., 1]
+        masks = []
+        for b, _wt in self.color_recipe:
+            d = np.minimum((hb - b) % self.HS_H, (b - hb) % self.HS_H)
+            masks.append((d <= 1) & (sm >= 40))
+        uni = masks[0].copy()
+        for mk in masks[1:]:
+            uni |= mk
+        tot_all = int(uni.sum())
+        if tot_all < 24:
+            return None
+        cs = uni.sum(axis=0).astype(np.float64)
+        rs = uni.sum(axis=1).astype(np.float64)
+
+        def lo_hi(prof, frac=0.01):
+            c = np.cumsum(prof)
+            return (int(np.searchsorted(c, frac * c[-1])),
+                    int(np.searchsorted(c, (1.0 - frac) * c[-1])))
+
+        cxs, cxe = lo_hi(cs)
+        cys, cye = lo_hi(rs)
+        scale = float(np.sqrt(max(1.0, (cxe - cxs + 1) * (cye - cys + 1))))
+        jx = np.arange(ww, dtype=np.float64)
+        jy = np.arange(hh, dtype=np.float64)
+
+        def mom(mk):
+            t = float(mk.sum())
+            if t < 6:
+                return None
+            c = mk.sum(axis=0).astype(np.float64)
+            r = mk.sum(axis=1).astype(np.float64)
+            cx = float((c * jx).sum() / t)
+            cy = float((r * jy).sum() / t)
+            vx = float((c * jx * jx).sum() / t) - cx * cx
+            vy = float((r * jy * jy).sum() / t) - cy * cy
+            return t, cx, cy, math.sqrt(max(0.0, vx + vy))
+
+        mu = mom(uni)
+        if mu is None:
+            return None
+        _, cX, cY, _ = mu
+        desc = np.zeros((len(masks), 5))
+        for i, mk in enumerate(masks):
+            m = mom(mk)
+            if m is None:
+                continue
+            t, cx, cy, sp = m
+            desc[i] = (t / tot_all, math.hypot(cx - cX, cy - cY) / scale, sp / scale,
+                       (cx - cX) / scale, (cy - cY) / scale)
+        clip = (cxs <= 2 or cys <= 2 or cxe >= ww - 3 or cye >= hh - 3)
+        delta = ((cX - (ww - 1) / 2.0) / scale, (cY - (hh - 1) / 2.0) / scale)
+        return delta, desc, bool(clip)
 
     def _mark_lost(self, now):
         """进入丢失状态，并记住丢失时的目标框（重捕获以它为中心）。"""
@@ -1670,18 +1987,13 @@ class TargetTracker:
         self.state = self.STATE_LOST
 
     def region_margin(self, lost_sec):
-        """丢失后搜索域：**固定策略**——云台不动，以丢失时目标框中心为中心，
-            长宽各扩大 2 倍（margin=1.0，即搜索窗面积 = 目标框的 4 倍）。
-            不再按丢失时长分层升级：4 倍面积一次搜索仅数毫秒，逐级放大只会让目标
-        """
+        """丢失后搜索域：**固定策略**——云台不动，以丢失时目标框中心为中心，。"""
         return self.search_margin, 1
 
-# 三、控制器：像素误差 -> 角速度 -> 角度指令
+# 六、控制器：像素误差 -> 角速度 -> 角度指令
 
 def segment_at(bgr, px, py, seed_frac=0.06, win_frac=0.28, iters=4):
-    """【点击选物】点一下 (px,py)，自动找出该点所在物体的**边界**并返回外接框。
-    返回 (x, y, w, h) 或 None。
-    """
+    """【点击选物】点一下 (px,py)，自动找出该点所在物体的**边界**并返回外接框。"""
     H, W = bgr.shape[:2]
     px, py = int(round(px)), int(round(py))
     if not (0 <= px < W and 0 <= py < H):
@@ -1695,19 +2007,24 @@ def segment_at(bgr, px, py, seed_frac=0.06, win_frac=0.28, iters=4):
         return None
     lx, ly = px - x0, py - y0                    # 点击点在子窗里的坐标
 
+    # ---------- ① 局部颜色模型 + 区域生长 ----------
     box = _grow_by_color(sub, lx, ly, seed_frac)
     if box is not None:
+        # ---------- ② 边界吸附（贴到真实轮廓）----------
         box = _snap_to_edges(sub, box)
         gx, gy, gw, gh = box
         area = gw * gh
         # 尺度先验：太小（碎片）或"铺满整个搜索窗且毫无边界"（同色背景成片）都拒绝。 注意：物体本来就可能比搜索窗大（近景伞），所以"占满窗口"只在**边缘吸附后 仍无一条边落在强边缘上**时才判失败 ——
+        # 交给 _snap_to_edges 的返回值体现。
         if 0.004 * rw * rw <= area <= 0.985 * rw * rw and gw >= 10 and gh >= 10:
             return (float(gx + x0), float(gy + y0), float(gw), float(gh))
 
+    # ---------- ③ 回退：GrabCut（稳但慢，只在生长失败时才用）----------
     best = _grabcut_box(sub, lx, ly, iters)
     if best is not None:
         return (float(best[0] + x0), float(best[1] + y0), float(best[2]), float(best[3]))
 
+    # ---------- ③b 再回退：颜色+边缘掩膜（measure_extent）----------
     seed = (float(clamp(px - rw * 0.12, 0, W - 1)), float(clamp(py - rw * 0.12, 0, H - 1)),
             float(max(12, rw * 0.24)), float(max(12, rw * 0.24)))
     tr = TargetTracker()
@@ -1722,9 +2039,7 @@ def segment_at(bgr, px, py, seed_frac=0.06, win_frac=0.28, iters=4):
     return bx
 
 def _grow_by_color(sub, lx, ly, seed_frac=0.06, d_h=18, d_s=45, d_v=110):
-    """
-    局部颜色区域生长：返回含点击点的连通域外接框 (gx,gy,gw,gh) 或 None。
-    """
+    """局部颜色区域生长：返回含点击点的连通域外接框 (gx,gy,gw,gh) 或 None。"""
     h, w = sub.shape[:2]
     hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV).astype(np.int32)
     s = max(2, int(round(min(h, w) * seed_frac)))
@@ -1734,13 +2049,12 @@ def _grow_by_color(sub, lx, ly, seed_frac=0.06, d_h=18, d_s=45, d_v=110):
     if seed.size == 0:
         return None
     med = np.median(seed, axis=0)
-    # **用 MAD（中位绝对偏差）代替 std 估散布**：std 会被种子块里的少数背景/高光像素 拉大，阈值随之被撑爆。d.mp4 紫伞实测：种子块 25×25 里混进几粒背景，std_V=21.4
+    # **用 MAD（中位绝对偏差）代替 std 估散布**：std 会被种子块里的少数背景/高光像素 拉大，阈值随之被撑爆。d.mp4 紫伞实测：种子块 25×25 里混进几粒背景，std_V=21.4 ->
+    # dv=124，于是区域生长顺着伞柄/身体那截相同低饱和像素**竖着长到 144**（真值 85）， 框选"完全没框住"。MAD 对离群点稳健，1.4826·MAD ≈ 正态下的 σ，但不受少量杂点影响。
     mad = np.median(np.abs(seed - med), axis=0) * 1.4826
 
     def _blob(v_cap, s_cap):
-        """
-        给定 S/V 阈值上限，跑一遍"颜色掩膜 -> 形态学 -> 取含点击点的连通域"，返回
-        """
+        """给定 S/V 阈值上限，跑一遍"颜色掩膜 -> 形态学 -> 取含点击点的连通域"，返回。"""
         th = max(d_h, min(50, 3.0 * float(mad[0]) + 10))
         ts = max(d_s, min(s_cap, 3.0 * float(mad[1]) + 25))
         tv = min(v_cap, 3.0 * float(mad[2]) + 45)
@@ -1753,6 +2067,7 @@ def _grow_by_color(sub, lx, ly, seed_frac=0.06, d_h=18, d_s=45, d_v=110):
             mk = ((ds <= ts) & (dv <= tv)).astype(np.uint8) * 255
         else:
             mk = ((dh <= th) & (ds <= ts) & (dv <= tv)).astype(np.uint8) * 255
+        # 形态学：开去噪 -> 闭连体 -> 填洞
         k = max(3, int(round(0.02 * min(h, w))) | 1)
         el = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
         mk = cv2.morphologyEx(mk, cv2.MORPH_OPEN, el)
@@ -1779,6 +2094,7 @@ def _grow_by_color(sub, lx, ly, seed_frac=0.06, d_h=18, d_s=45, d_v=110):
 
     r = _blob(160, 90)
     # **整窗泄漏闸门 -> 收紧 V 重试**：区域生长把画面里一大片（含树叶/路面）连成一块时， 外接框会几乎铺满整个搜索窗（实测：点伞阴面时种子紫灰 ≈ 潮湿路面灰，漏到 183×202， 填充
+    # 0.81）。这种情况**不是**回退 GrabCut 的理由 —— 阴影里的物体自身颜色仍是一致的， 把 V 上限收到一半再跑一遍就能和路面分开。只有收紧后仍泄漏才判失败。
     if r is not None and (r[2] >= 0.92 * w or r[3] >= 0.92 * h):
         r2 = _blob(48, 60)
         if r2 is not None and r2[2] < 0.92 * w and r2[3] < 0.92 * h:
@@ -1788,11 +2104,16 @@ def _grow_by_color(sub, lx, ly, seed_frac=0.06, d_h=18, d_s=45, d_v=110):
     if r is None:
         return None
     gx, gy, gw, gh, fill, sub_lab = r
+    # 触发条件用**长宽比**（比填充率可靠）：区域生长"竖着漏下去"的典型特征是外接框 比点击物体的形状更"高瘦"。这里只要连通域明显偏瘦高（gh > 1.15·gw）且填充率 不算高（<0.72，真圆顶伞面约
+    # 0.74 但混入尾巴后会掉），就做一次逐行截断。
     if gh > 1.15 * gw and fill < 0.72:
+        # 竖直方向漏：逐行统计"该行在该连通域内的像素数"，从点击行向外扩展， 直到行填充率跌到峰值的一半 -> 截断（砍掉尾巴）。
         sub_lab = sub_lab.astype(np.uint8)
         rows = sub_lab[gy:gy + gh, gx:gx + gw].sum(axis=1).astype(np.float32)
+        # 伞面（宽的一坨）所在行的宽度中位数当"主体宽度"；尾巴行明显窄于它。
         main_w = float(np.median(rows[rows >= 0.5 * rows.max()])) or 1.0
         keep = rows >= 0.55 * main_w          # 逐行：够宽才算"主体"
+        # 从点击行向上下扩展 keep，遇到连续 2 行窄就停
         cyr = int(clamp(ly - gy, 0, gh - 1))
         top = cyr
         miss = 0
@@ -1823,9 +2144,7 @@ def _grow_by_color(sub, lx, ly, seed_frac=0.06, d_h=18, d_s=45, d_v=110):
     return (gx, gy, gw, gh)
 
 def _snap_to_edges(sub, box, snap=12):
-    """
-    把外接框的每条边向附近最强 Sobel 边缘吸附，让框贴合物体真实轮廓。
-    """
+    """把外接框的每条边向附近最强 Sobel 边缘吸附，让框贴合物体真实轮廓。"""
     gx, gy, gw, gh = box
     h, w = sub.shape[:2]
     gray = cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -1833,7 +2152,7 @@ def _snap_to_edges(sub, box, snap=12):
     ey = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
 
     def snap_axis(profile, cur, lo, hi):
-        """profile: 1D 边缘强度；在 cur±snap 内找最强的位置（带轻微向 cur 的偏好）"""
+        """profile: 1D 边缘强度；在 cur±snap 内找最强的位置（带轻微向 cur 的偏好）。"""
         a = max(lo, cur - snap)
         b = min(hi, cur + snap)
         if b - a < 2:
@@ -1860,10 +2179,9 @@ def _snap_to_edges(sub, box, snap=12):
     return (int(nx), int(ny), int(nw), int(nh))
 
 def _grabcut_box(sub, lx, ly, iters=4, seed_frac=0.06):
-    """GrabCut 两段式（回退路径）：返回子窗坐标外接框或 None。
-    子窗本来就 ≤~200px，再小反而丢细节。求得框后按 2x 映射回原坐标。
-    """
+    """GrabCut 两段式（回退路径）：返回子窗坐标外接框或 None。"""
     h0, w0 = sub.shape[:2]
+    # 0.3 倍足够保住外接框精度（子窗 ≤200px -> ≥60px），又把 GrabCut 的耗时砍掉一半 （大面积同色区域上 GrabCut 代价随边长非线性增长）。小窗不缩，免得丢细节。
     SC = 0.3 if min(h0, w0) >= 160 else (0.4 if min(h0, w0) >= 96 else 1.0)
     if SC != 1.0:
         sub = cv2.resize(sub, (max(24, int(round(w0 * SC))), max(24, int(round(h0 * SC)))),
@@ -1910,8 +2228,8 @@ def _grabcut_box(sub, lx, ly, iters=4, seed_frac=0.06):
 # 七、绘制
 
 def run(args):
-    # P0：把 Windows 定时器精度提到 1ms。否则 waitKey(delay) 的休眠按 15.6ms 量化
-    # （delay≈18ms 会被睡成 ~31ms），主循环被钉在 ~21fps。实测 21.0 → 26.8fps。
+    # P0：把 Windows 定时器精度提到 1ms。否则 waitKey(delay) 的休眠按 15.6ms 量化 （delay≈18ms 会被睡成 ~31ms），主循环被钉在 ~21fps。实测 21.0
+    # → 26.8fps。
     try:
         import ctypes
         ctypes.windll.winmm.timeBeginPeriod(1)
@@ -1932,7 +2250,8 @@ def run(args):
     rig = isinstance(cam, SimCamera) and not src.is_camera
     two_panel = rig
     tracker = TargetTracker(score_keep=args.score_keep, lost_after=args.lost_after,
-                            llr_min=args.llr_min, gm_rot_every=args.gm_rot_every)
+                            llr_min=args.llr_min, gm_rot_every=args.gm_rot_every,
+                            anchor_t_min=args.anchor_t_min, anchor_r_min=args.anchor_r_min)
     # 视频在环时**默认关掉速度前馈**：前馈要算"目标在世界里的角速度 = 云台实测角速度 +
     kff = (0.0 if rig else 1.0) if args.kff is None else float(args.kff)
     ctrl = FollowController(hfov=args.hfov, vfov=args.vfov, kp=args.kp, kd=args.kd,
@@ -1971,6 +2290,7 @@ def run(args):
             x0, y0 = ui["drag"]
             ui["box"] = (min(x0, x), min(y0, y), abs(x - x0), abs(y - y0))
         elif event == cv2.EVENT_LBUTTONUP:
+            # 点击（几乎没拖动）= 自动识别该点所在物体的边界并框选； 拖出框 = 手动框选（两种都保留）
             if ui["box"] is not None and ui["box"][2] > 8 and ui["box"][3] > 8:
                 ui["pending_init"] = ui["box"]
             elif ui["drag"] is not None and abs(x - ui["drag"][0]) <= 4 \
@@ -1989,7 +2309,7 @@ def run(args):
     else:
         print("提示：用鼠标在窗口里拖一个框选中目标（或下次用 --init x y w h）")
 
-    print("""video_proc40 目标跟随（静态等待模式 + 点击选物）
+    print("""attempt13 目标跟随（静态等待模式 + 点击选物）
   鼠标**点一下**=自动识别该点所在物体并框选   鼠标**拖框**=手动框选
   r 重选+回正  空格 暂停  q/ESC/关窗 退出（画面不显示文字，HUD 逐帧写 CSV）
   控制器 kp=%.2f kd=%.2f kff=%.2f 死区=%.2f°(横纵同值) 限速=%.0f°/s 低通=%.2fs
@@ -2006,6 +2326,7 @@ def run(args):
     win_gone = 0                          # 关窗确认计数（连续多少次读不到窗口）
     t_start = time.perf_counter()
 
+    # HUD 文字不再画在画面上：逐帧写入 CSV，画面只保留图形（十字/死区框/目标框/搜索框）
     stem = "camera" if not args.video else os.path.splitext(
         os.path.basename(args.video[0]))[0]
     csv_fh, csv_path = None, None
@@ -2017,7 +2338,8 @@ def run(args):
         csv_fh = open(csv_path, "w", newline="", encoding="utf-8")
         csv_fh.write("frame,t,dt_ms,fps,state,score,box_x,box_y,box_w,box_h,"
                      "err_x,err_y,cmd_pan,cmd_tilt,cam_pan,cam_tilt,hold,paused,"
-                     "lost_t,n_recover\n")
+                     "lost_t,n_recover,src,s_t,s_r,anchored,id_ok,"
+                     "dlt_x,dlt_y,dinv,ddir,clip\n")
         print("HUD 文字写入 %s（画面上不再显示任何文字）" % csv_path)
 
     while True:
@@ -2028,6 +2350,7 @@ def run(args):
         fps_hist.append(1.0 / dt)
         tracker._now = t_now
 
+        # ---- 读帧（暂停时不读，画面冻住）----
         if ui["paused"]:
             ok = True
         elif t_frame > 1:
@@ -2046,9 +2369,12 @@ def run(args):
             frame_i += 1
 
         # 云台转动 -> 画面变化：以**当前帧**为取景源（清晰、实时），云台角度直接平移画面， 露出画面外的地方填黑。为什么不做拼接图取景：单帧拼接在手持/走动视频上有视差，
+        # 必然错缝重影，而且"只写一次"的拼接图天生是历史画面 —— 云台一转就在上面滑， 看起来就是"几帧糅合的静止图在乱晃"（而且每帧多花 20~30ms，帧率腰斩）。
         if isinstance(cam, SimCamera):
             view = cam.render(frame)
+            # 把"哪块是真实像素"告诉跟踪器：云台平移露出的黑边不进检测范围 （不进 LLR 图、不进匹配响应、不进模型、框也不许夹到那里去）
             tracker.set_valid_rect(cam.valid_rect())
+            # **把本帧 view 的云台角告诉跟踪器**（修"画面动、框不动然后丢"）： 云台一转，目标在画面里就整体移动 -Δpan*ppd 像素。跟踪器要用这个量做
             # 搜索窗**前馈**，否则一次云台动作就把目标推出搜索半径（见 update 的 ⓪）。
             tracker.set_view_angles(cam.ang[0], cam.ang[1], (W, H),
                                     (cam.ppd_x, cam.ppd_y))
@@ -2060,6 +2386,7 @@ def run(args):
             view = cv2.resize(view, (W, H))
         gray = cv2.cvtColor(view, cv2.COLOR_BGR2GRAY)
 
+        # ---- 回正（r/p/c 都走这里）：回正期间**独占云台控制** ---- 之前把回正放在跟踪控制之前，同一帧后面的 ctrl.update(hold=True) 会把速率 清零 ->
         # 每帧只挪一下就停 -> 按 r 等于没反应（踩过这个坑，现在有整机自检）
         recentering = bool(ui["recenter"]) and not ui["paused"]
         if recentering:
@@ -2078,6 +2405,7 @@ def run(args):
                 ctrl.reset()
                 print("已锁定目标框", [int(v) for v in b])
         if ui.get("pending_click") is not None:
+            # 【点击选物】点击点 -> 自动识别所在物体边界 -> 框选
             cxp, cyp = ui.pop("pending_click")
             t_seg = time.perf_counter()
             sb = segment_at(view, cxp, cyp)
@@ -2094,14 +2422,17 @@ def run(args):
             tracker.box = None
             print("已清除目标，请重新拖框")
 
+        # ---- 跟踪 + 丢失重捕获 ----
         ok_tr, box, score, state = False, tracker.box, tracker.score, tracker.state
         search_rect = None
         if not ui["paused"] and not recentering and tracker.template is not None:
+            # 跟踪/搜索全部包在 try 里：程序绝不因为目标出框而死掉。
             try:
                 ok_tr, box, score, state = tracker.update(gray, view, dt)
             except Exception as exc:
                 print("跟踪器异常（已忽略本帧）：%s: %s" % (type(exc).__name__, exc))
             if state == TargetTracker.STATE_LOST:
+                # 云台不动，以丢失时目标框中心为中心，长宽扩大 2 倍（area 4×）， 用最后的颜色比例特征找。4 倍面积一次搜索仅数毫秒 -> 每帧都搜。
                 margin = tracker.search_margin
                 b0 = tracker.lost_box if tracker.lost_box is not None else tracker.box
                 if b0 is not None:
@@ -2112,7 +2443,11 @@ def run(args):
                     ccy = b0[1] + bh / 2.0
                     sx = int(clamp(ccx - rw / 2.0, 0, W - rw))
                     sy = int(clamp(ccy - rh / 2.0, 0, H - rh))
-                    search_rect = (sx, sy, rw, rh)
+                    # ★绿色搜索框也要夹到**真实像素区**：原来夹的是整幅画面，所以云台一转，
+                    #   搜索框会画进黑边里（"框还没出去、搜索框先出去了"）。
+                    _sr = tracker._clamp_valid((ccx - rw / 2.0, ccy - rh / 2.0, rw, rh), W, H)
+                    sx, sy = int(round(_sr[0])), int(round(_sr[1]))
+                    search_rect = (sx, sy, int(round(_sr[2])), int(round(_sr[3])))
                     try:
                         got = tracker.search_region(view, gray, (ccx, ccy), margin, t_now)
                     except Exception as exc:
@@ -2120,6 +2455,7 @@ def run(args):
                         print("区域搜索异常（已忽略）：%s: %s" % (type(exc).__name__, exc))
                     if got is not None:
                         box, score, state = got[0], got[1], TargetTracker.STATE_TRACK
+            # 锚点只从**最后一次置信框**（tracker.anchor_box）更新，不用当前框： 当前框可能是被棘轮推大的垃圾框，用它当圆心 -> 附近搜索永远搜错地方
             if state == TargetTracker.STATE_TRACK and tracker.anchor_box is not None:
                 ab = tracker.anchor_box
                 anchor_bearing[:] = ctrl.bearing_of(
@@ -2151,6 +2487,7 @@ def run(args):
         if gstate is not None:
             gstate.update(ctrl.pan, ctrl.tilt)
 
+        # ---- 画布 ----
         if two_panel:
             canvas = np.zeros((H, W * 2 + GAP, 3), np.uint8)
             canvas[:, :W] = frame
@@ -2166,14 +2503,24 @@ def run(args):
                 int(box[0]), int(box[1]), int(box[2]), int(box[3]))
             sc = float(score) if score is not None else 0.0
             csv_fh.write("%d,%.4f,%.2f,%.2f,%s,%.4f,%s,%+.5f,%+.5f,%+.3f,%+.3f,"
-                         "%+.3f,%+.3f,%s,%s,%.3f,%d\n"
+                         "%+.3f,%+.3f,%s,%s,%.3f,%d,%s,%.3f,%.3f,%d,%d,"
+                         "%.3f,%.3f,%.3f,%.3f,%d\n"
                          % (t_frame, t_now - t_start, dt * 1000.0,
                             sum(fps_hist) / len(fps_hist), state, sc, b4,
                             err[0], err[1], info["pan"], info["tilt"],
                             st_cam["pan"], st_cam["tilt"],
                             "1" if hold else "0", "1" if ui["paused"] else "0",
                             (t_now - tracker.lost_since) if tracker.lost_since else 0.0,
-                            tracker.n_recover))
+                            tracker.n_recover, tracker.src,
+                            -1.0 if tracker.s_t is None else tracker.s_t,
+                            -1.0 if tracker.s_r is None else tracker.s_r,
+                            1 if tracker.anchored else 0,
+                            1 if tracker.id_ok else 0,
+                            -9.0 if tracker.sp_dlt is None else tracker.sp_dlt[0],
+                            -9.0 if tracker.sp_dlt is None else tracker.sp_dlt[1],
+                            -9.0 if tracker.sp_dinv is None else tracker.sp_dinv,
+                            -9.0 if tracker.sp_ddir is None else tracker.sp_ddir,
+                            -1 if tracker.sp_clip is None else (1 if tracker.sp_clip else 0)))
             if t_frame % 30 == 0:
                 csv_fh.flush()
 
@@ -2191,6 +2538,7 @@ def run(args):
             ui["recenter"] = True
         if t_frame > 2:
             # 关窗退出必须**连续多次**确认才认：忙帧（目标出框后每帧都在搜索，单帧 50ms+） 或用户拖动/缩放窗口时，这个属性会短暂读到 0，而这里以前是"一次读到 0 就 break" ——
+            # 表现就是"目标一出边框，画面卡一下然后程序自己退出"。
             try:
                 vis = cv2.getWindowProperty(MAIN_WIN, cv2.WND_PROP_VISIBLE)
             except cv2.error:
@@ -2212,12 +2560,12 @@ def run(args):
     cv2.destroyAllWindows()
     return 0
 
-# 十、闭环试验台 + 场景矩阵（4 个场景）
+# 八、闭环试验台 + 场景矩阵（4 个场景）
 
-# 十一、自检（8 项）
+# 九、自检（11 项）
 
 def _check_tracker():
-    """静止定位 + 遮挡后判定丢失 + 区域搜索找回"""
+    """静止定位 + 遮挡后判定丢失 + 区域搜索找回。"""
     st = SynthStage(320, 240, seed=1, tw=40, th=60)
     bgr = st.render(np.zeros(2, np.float32))
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -2248,7 +2596,7 @@ def _check_tracker():
     return err < 1.5 and lost and got is not None and iou > 0.5
 
 def _check_region_search():
-    """分层区域搜索：位移 + 尺度变化 + 颜色干扰物"""
+    """分层区域搜索：位移 + 尺度变化 + 颜色干扰物。"""
     st = SynthStage(640, 480, seed=5, tw=60, th=90)
     bgr = st.render(np.zeros(2, np.float32))
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -2257,6 +2605,7 @@ def _check_region_search():
     for i in range(5):                        # 先正常跟几帧，把模型建起来
         b = st.render(np.zeros(2, np.float32))
         tr.update(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), b, 1 / 30.0)
+    # 目标跳到偏移 +2 个框宽、且缩小 30%（静态等待场景：相机不动）
     st.rel = np.array([2.2 * 60.0, 0.6 * 90.0], np.float32)
     for i in range(5):
         k = 1.0 - 0.06 * i
@@ -2269,6 +2618,7 @@ def _check_region_search():
     iou = box_iou(r[0], st._box_on_screen(st.rel)) if r is not None else 0.0
     print("       位移 2.2 框宽 + 缩小 30%%：区域搜索 %s IoU %.2f"
           % ("成功" if r is not None else "失败", iou))
+    # 颜色干扰物：同形不同色（红色）放在旁边，目标保持原色
     st2 = SynthStage(640, 480, seed=5, tw=60, th=90)
     bgr0 = st2.render(np.zeros(2, np.float32), tint=(0, 0, 220))
     tr2 = TargetTracker()
@@ -2276,6 +2626,7 @@ def _check_region_search():
     for i in range(5):
         b = st2.render(np.zeros(2, np.float32), tint=(0, 0, 220))
         tr2.update(cv2.cvtColor(b, cv2.COLOR_BGR2GRAY), b, 1 / 30.0)
+    # 真目标跳开一点，同时在原处放一个"同形不同色(蓝)"的干扰物
     st2.rel = np.array([90.0, 40.0], np.float32)
     b = st2.render(np.zeros(2, np.float32), tint=(0, 0, 220))
     tb = st2._box_on_screen(st2.rel)
@@ -2302,8 +2653,7 @@ def _check_region_search():
     return iou > 0.4 and iou2 > 0.4 and lv_fg > 0 and lv_bg < lv_fg
 
 def _check_box_scale():
-    """框选自适应（颜色掩膜 + 边界 + 颜色比例）：静止不漂、缩放跟得上、不吃背景。
-    """
+    """框选自适应（颜色掩膜 + 边界 + 颜色比例）：静止不漂、缩放跟得上、不吃背景。"""
     def once(rate, frames=120):
         st = SynthStage(640, 480, seed=11, tw=120, th=160)
         base = np.clip(st.tgt.astype(np.float32) * 0.8 + 80.0, 0, 255).astype(np.uint8)
@@ -2341,9 +2691,7 @@ def _check_box_scale():
             and e3 < 8.0)
 
 def _check_black_region():
-    """
-    黑边（云台平移露出来的部分）必须被排除在检测范围之外。
-    """
+    """黑边（云台平移露出来的部分）必须被排除在检测范围之外。"""
     st = SynthStage(640, 480, seed=3, tw=60, th=90)
     base = st.render(np.zeros(2, np.float32), tint=(0, 0, 200))
     dx = 200                                  # 假装云台转了 200px：内容左移，右侧是黑边
@@ -2362,6 +2710,7 @@ def _check_black_region():
             over += 1
     iou = box_iou(b, vis)
 
+    # 目标走掉后的低纹理场景：只剩平坦背景 + 右侧黑边，起点故意贴近黑边
     flat = np.zeros_like(base)
     flat[:, :valid[2]] = 90
     flat[100:200, 100:200] = 30
@@ -2380,9 +2729,7 @@ def _check_black_region():
     return over == 0 and iou > 0.6 and fake == 0 and state2 == TargetTracker.STATE_LOST
 
 def _check_video_d():
-    """
-    用真实视频 d.mp4（雨天街道，打紫伞朝镜头走来的人）验证两件事：
-    """
+    """A. **无突变也不许丢失**：149 帧连续跟踪，一次都不许判丢失，分数中位数 >= 0.80。"""
     import os
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "d.mp4")
     if not os.path.exists(path):
@@ -2399,6 +2746,7 @@ def _check_video_d():
             break
         frames.append(f)
     cap.release()
+    # A. 连续跟踪
     tr = TargetTracker()
     tr.init(cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY), frames[0], BOX)
     scores, lost_a = [], None
@@ -2411,6 +2759,7 @@ def _check_video_d():
     med = float(np.median(scores))
     print("       A 连续跟踪 %d 帧：%s，分数中位 %.2f" %
           (i + 1 if lost_a is None else lost_a, "未丢失" if lost_a is None else "丢失@f%d" % lost_a, med))
+    # B. 遮挡 1s -> 附近搜索重捕获
     tr2 = TargetTracker()
     tr2.init(cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY), frames[0], BOX)
     x, y, w, h = [int(v) for v in BOX]
@@ -2442,9 +2791,7 @@ def _check_video_d():
     return ok
 
 def _check_no_sudden_loss():
-    """
-    【无突变突然丢失】回归：小目标/小搜索窗上 PSR 会被低估，不许因此丢掉好匹配。
-    """
+    """【无突变突然丢失】回归：小目标/小搜索窗上 PSR 会被低估，不许因此丢掉好匹配。"""
     import os
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "d.mp4")
     if not os.path.exists(path):
@@ -2463,6 +2810,8 @@ def _check_no_sudden_loss():
         print("       跳过：d.mp4 不足 149 帧")
         return True
     ok_all, worst = True, 0
+    # 多个"小框"（远处/局部目标）都应跟满 149 帧。**例外**：目标是**真的走出画面**时 允许如实丢失（那正是"如实报告丢失"的正确行为，不是 bug）。判据：丢失当帧框被
+    # 夹在画面边框上（贴着边、且分数在衰减）。
     boxes = [(560, 300, 60, 90), (540, 300, 80, 110)]
     Hf, Wf = frames[0].shape[:2]
     for box in boxes:
@@ -2476,6 +2825,7 @@ def _check_no_sudden_loss():
                 lost = i
                 break
         if lost is not None and last_b is not None:
+            # 丢失当帧的框是否贴在边框上（判"真出画"）
             near_border = (last_b[0] <= 1.0 or last_b[1] <= 1.0
                            or last_b[0] + last_b[2] >= Wf - 1.0
                            or last_b[1] + last_b[3] >= Hf - 1.0)
@@ -2489,9 +2839,7 @@ def _check_no_sudden_loss():
     return ok_all
 
 def _check_click_segment():
-    """
-    点击选物：点物体 -> 框住该物体的边界（紧、稳）；点空地 -> 必须拒绝。
-    """
+    """用 d.mp4 f500（打紫伞的人）。用 HSV 直接抠出"紫色雨伞"当**几何 GT**（伞不在手选。"""
     import os
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "d.mp4")
     if not os.path.exists(path):
@@ -2504,6 +2852,7 @@ def _check_click_segment():
     if not ok:
         print("       跳过：读帧失败")
         return True
+    # ---- 紫色伞的几何 GT ----
     hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
     pm = cv2.inRange(hsv, (125, 60, 50), (170, 255, 255))
     pm = cv2.morphologyEx(pm, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
@@ -2518,6 +2867,7 @@ def _check_click_segment():
     segment_at(f, 606, 372)                    # 预热：cv2 首次调用有一次性初始化开销
     boxes, ms = [], 0.0
     for (px, py) in pts:
+        # 取多次运行的中位数：OpenCV 线程池在中途可能被前面的检查拖进慢状态， 单次计时会偶发虚高；中位数反映真实单帧开销。
         ts = []
         b = None
         for _r in range(3):
@@ -2528,6 +2878,7 @@ def _check_click_segment():
         boxes.append(None if b is None else tuple(float(v) for v in b))
     ious = [box_iou(b, gt) if b else 0.0 for b in boxes]
     tight = sum(1 for v in ious if v >= 0.55) >= 3           # 至少 3/4 个点够紧
+    # 稳定：两两 IoU 的均值
     pair = []
     for a in range(len(boxes)):
         for b in range(a + 1, len(boxes)):
@@ -2544,8 +2895,7 @@ def _check_click_segment():
     return tight and stable and ms < 40.0 and ok_air
 
 def _check_target_exits():
-    """目标**走出边框**：不许抛异常、必须如实判丢失、框必须留在画面内、丢失后搜索不许炸。
-    """
+    """目标**走出边框**：不许抛异常、必须如实判丢失、框必须留在画面内、丢失后搜索不许炸。"""
     st = SynthStage(640, 480, seed=2, tw=60, th=90)
     b0 = st.render(np.zeros(2, np.float32), tint=(0, 0, 200))
     tr = TargetTracker()
@@ -2565,6 +2915,7 @@ def _check_target_exits():
             break
     inside = (box is not None and box[0] >= -1.0 and box[1] >= -1.0
               and box[0] + box[2] <= 641.0 and box[1] + box[3] <= 481.0)
+    # 固定搜索域：任何丢失时长都返回同一个外扩倍数（1.0 = 面积 4×）
     tiers = [tr.region_margin(s)[0] for s in (0.1, 1.0, 3.0, 10.0)]
     tiers_ok = all(abs(v - tr.search_margin) < 1e-9 for v in tiers)
     print("       走出边框：%s；末状态 %s；框留在画面内=%s；固定搜索域 %s=%s"
@@ -2617,7 +2968,7 @@ def _check_sim_plant():
     return abs(rate - 100.0) < 12.0 and early < 1.0 and late > 20.0 and abs(held - fwd) < 0.6
 
 def _check_gimbal_state_and_recenter(tmp_state):
-    """角度存储往返 + 损坏文件降级 + 整机回正（预置角度 -> 按 r -> 回到 0）"""
+    """角度存储往返 + 损坏文件降级 + 整机回正（预置角度 -> 按 r -> 回到 0）。"""
     import tempfile
     if os.path.exists(tmp_state):
         os.remove(tmp_state)
@@ -2683,9 +3034,9 @@ def _check_gimbal_state_and_recenter(tmp_state):
     return ok_state and broken_ok and got_zero
 
 def run_selftest():
-    """自检 8 项：跟踪/区域搜索/颜色模型/控制器/云台模型/闭环/角度存储与回正"""
+    """自检 11 项：跟踪/颜色比例重捕获/框选自适应/黑边区/真实视频/无突变丢失/点击选物/走出边框/。"""
     print("=" * 68)
-    print("video_proc40 自检（颜色比例特征重捕获 + HSV 模型）  OpenCV %s"
+    print("attempt13 自检（颜色比例特征重捕获 + HSV 模型）  OpenCV %s"
           % cv2.__version__)
     print("=" * 68)
     import tempfile
@@ -2717,7 +3068,7 @@ def run_selftest():
     print("=====================================================")
     return 0 if ok else 1
 
-# 十二、命令行
+# 十、命令行
 
 def build_parser():
     ap = argparse.ArgumentParser(description="目标跟随（静态等待模式）attempt8")
@@ -2756,11 +3107,18 @@ def build_parser():
     ap.add_argument("--llr-min", dest="llr_min", type=float, default=0.02,
                     help="前景/背景对数似然比门槛（决定要不要写进模型）")
     ap.add_argument("--gm-rot-every", dest="gm_rot_every", type=int, default=1,
-                    help="video_proc40: ORB 旋转估计每多少帧做一次（默认 1=每帧；"
+                    help="attempt12: ORB 旋转估计每多少帧做一次（默认 1=每帧；"
                          "3 可省 ~1.6ms/帧，但对旋转敏感视频可能降精度）")
     ap.add_argument("--gm-orb-n", dest="gm_orb_n", type=int, default=200,
-                    help="video_proc40: ORB 特征数（默认 200，原 attempt10 为 400；"
+                    help="attempt12: ORB 特征数（默认 200，原 attempt10 为 400；"
                          "减小可省 ~0.3ms/帧，特征太少时旋转估计会不稳）")
+
+    ap.add_argument("--anchor-t", dest="anchor_t_min", type=float, default=0.15,
+                    help="attempt14: 与'出生灰度模板'的相似度下限。★实测它随外观自然演化会衰减到"
+                         "~0.28（目标跟得好好的），所以只当'灾难性不匹配'兜底，默认 0.15；"
+                         "且只在与出生锚尺寸几乎一致时才生效。0 = 关闭该锚")
+    ap.add_argument("--anchor-r", dest="anchor_r_min", type=float, default=0.55,
+                    help="attempt14: 当前框颜色构成与'出生配方'的相似度下限。0 = 关闭该锚")
 
     ap.add_argument("--real", choices=("none", "serial"), default="none",
                     help="云台接口：none=虚拟云台(默认) / serial=串口")
@@ -2768,6 +3126,7 @@ def build_parser():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--no-cam", dest="no_cam", action="store_true", help="只跟踪不驱动云台")
 
+    # 仿真执行器只有这三项值得动（延迟/限速/回差），其余用默认（角加速度 600、死区 0.5°）
     ap.add_argument("--latency", type=float, default=0.10, help="仿真云台延迟(s)")
     ap.add_argument("--sim-rate", dest="sim_rate", type=float, default=120.0)
     ap.add_argument("--sim-backlash", dest="sim_backlash", type=float, default=1.0)
@@ -2782,9 +3141,7 @@ def build_parser():
     return ap
 
 def _install_crash_reporter():
-    """
-    顶层异常兜底：把完整 traceback + 排查用的现场状态打到 stderr。
-    """
+    """顶层异常兜底：把完整 traceback + 排查用的现场状态打到 stderr。"""
     import traceback as _tb
     import sys as _sys
     _real_hook = _sys.excepthook
